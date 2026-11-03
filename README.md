@@ -199,6 +199,54 @@ new key, disclosed endpoint, network reconfiguration or third-party relay is
 unnecessary. Failed transfers can be retried against existing remote files;
 matching files are skipped, and unrelated files are not deleted.
 
+### Long-running remote work
+
+Codex MCP calls time out after one to five minutes, and progress notifications
+do not extend that limit. These private tools therefore return at once and are
+polled instead. Remote paths are relative to the remote home (`~/` is optional).
+Absolute paths, `..` escapes and symbolic link components are refused.
+
+- `job_start(command, job_id?)` installs `~/.local/bin/codex-job` on first use
+  (it is replaced only when its SHA-256 differs) and starts the command text
+  under bash in a new session. The job survives SSH disconnects and worker
+  restarts. State and the merged stdout/stderr log are kept in `~/.codex-jobs/<id>/`.
+- `job_status(job_id)` returns `running`, `exited` (with `exit_code`, and
+  `killed=true` after `job_kill`), `lost` or `unknown_id`. A job is `lost` when
+  its process is gone without an exit code, which means failure.
+- `job_tail(job_id, lines)` returns the last 1-10000 log lines, at most 256 KB.
+- `job_kill(job_id)` sends SIGTERM to the process group, then SIGKILL after 5 s.
+  `job_list()` lists the jobs without their command text.
+- `push_start(local_path, remote_path, job_id?)` starts a detached local
+  `rsync` over OpenSSH and returns a `push_id`. Interrupted pushes keep partial
+  files in `.rsync-partial`, so a new push to the same destination resends
+  only the missing data. The connection settings and any password exist only
+  in 0600 files in a 0700 private directory while the push runs. They are
+  never passed in argv or environment values.
+- `push_status(push_id)` reads from local disk, so it still works after a
+  worker restart. It returns `starting`, `hashing`, `transferring`,
+  `verifying`, `completed`, `failed`, `cancelled`, `lost` or `unknown_id`.
+  `failed` and `lost` carry one fixed `reason`: `transfer_failed`,
+  `connection_failed`, `partial_transfer`, `verify_mismatch`,
+  `verify_unavailable`, `runner_lost`, `start_failed` or `internal_error`. Only
+  `completed` means a remote SHA-256 check of every file passed. `verify`
+  reports the passed and failed counts and up to five failed relative paths.
+  `push_cancel(push_id)` stops the push.
+- `write_remote_file(remote_path, content, mode)` atomically writes UTF-8 text
+  of at most 1 MB (default mode 0600; group/other write is refused).
+  `read_remote_file(remote_path, max_bytes)` reads text and refuses binary files.
+
+`progress` in `push_status` contains only numbers and the transfer rate,
+never file names:
+
+```json
+{"phase": "transfer", "bytes_done": 1048576, "bytes_total": 4194304,
+ "files_transferred": 3, "files_total": 12, "entries_to_check": 9,
+ "entries_total": 12, "percent": 25, "rate": "10.50MB/s", "updated_at": 1700000000.0}
+```
+
+During long work the agent also overwrites `progress.txt` in its workspace
+with a single line of at most 2 KB.
+
 Remote `fetch_file` streams a file into a private artifact without the old
 10 MiB ceiling. Internal `export_file` publishes a locally generated file, or a
 directory as an uncompressed tar, as an opaque artifact. To save a real file,

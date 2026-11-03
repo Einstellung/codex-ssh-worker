@@ -1,6 +1,8 @@
 import asyncio
 import json
+import re
 import time
+import uuid
 from typing import Annotated
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -10,7 +12,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from .attachments import save_artifact, stage_inputs
 from .config import JOB_ID, load_settings
-from .remote import Remote
+from .remote import BinaryFileError, Remote
 
 
 TERMINAL = {"completed", "failed", "blocked", "partial", "cancelled", "timed_out", "interrupted"}
@@ -311,6 +313,132 @@ def public_mcp(socket_path):
     create_public_mcp(socket_path).run(transport="stdio")
 
 
+REMOTE_JOB_ID = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+JOB_STATES = {"running", "exited", "lost", "unknown_id"}
+GPU_HINT = (" For GPU work first run remote_exec with `nvidia-smi --query-gpu=index,memory.used,memory.total,"
+            "utilization.gpu --format=csv` and set CUDA_VISIBLE_DEVICES to idle cards inside the command; the server is shared.")
+
+
+def _job_state(value):
+    # Re-build from known keys so nothing unexpected from the remote side leaks through.
+    if value.get("state") not in JOB_STATES:
+        raise ValueError("invalid job state")
+    keys = ("id", "state", "exit_code", "killed", "started_at", "finished_at", "log_bytes")
+    return {key: value[key] for key in keys if key in value}
+
+
+def register_remote_tools(mcp, remote, push_root, audit):
+    """Tools that always return immediately: durable remote jobs, pushes and small file edits."""
+    from .push import cancel_push, push_status as read_push, start_push
+
+    def remote_job_id(job_id):
+        job_id = job_id or "job-" + uuid.uuid4().hex[:12]
+        if not isinstance(job_id, str) or not REMOTE_JOB_ID.fullmatch(job_id) or job_id in (".", ".."):
+            raise ValueError("invalid job id")
+        return job_id
+
+    def guarded(name, error_code, function):
+        try:
+            result = function()
+            audit(name, "error_code" not in result and result.get("state") not in ("lost", "unknown_id", "failed"))
+            return result
+        except Exception:
+            audit(name, False)
+            return {"error_code": error_code}
+
+    def job_start(command: str, job_id: str | None = None) -> dict:
+        """Start a long-running remote shell command as a durable background job and return at once with its job_id. Use this, not remote_exec, for anything that may run longer than a minute. The command text runs under bash in the remote home with stdout+stderr merged into the job log; it survives SSH disconnects and worker restarts. Poll with job_status, read output with job_tail, stop with job_kill. Write checkpoints for resumable work."""
+        def run():
+            identifier = remote_job_id(job_id)
+            if not isinstance(command, str) or not command.strip():
+                return {"error_code": "empty_command"}
+            [state] = remote.job_json("start", identifier, stdin=command.encode())
+            return {"error_code": state["error"]} if "error" in state else _job_state(state)
+        return guarded("job_start", "job_start_failed", run)
+
+    # FastMCP reads __doc__; a concatenated literal would not be a docstring.
+    job_start.__doc__ += GPU_HINT
+    mcp.tool()(job_start)
+
+    @mcp.tool()
+    def job_status(job_id: str) -> dict:
+        """Return one job's state immediately: running, exited (with exit_code; killed=true after job_kill), lost (process gone without an exit code: treat as failure, never success) or unknown_id."""
+        def run():
+            [state] = remote.job_json("status", remote_job_id(job_id))
+            return {"error_code": state["error"]} if "error" in state else _job_state(state)
+        return guarded("job_status", "job_status_failed", run)
+
+    @mcp.tool()
+    def job_tail(job_id: str, lines: int = 100) -> dict:
+        """Return the last 1-10000 lines (at most 256 KB) of a job's merged stdout/stderr log, immediately."""
+        def run():
+            if type(lines) is not int or not 1 <= lines <= 10000:
+                return {"error_code": "invalid_lines"}
+            result = remote.job_command("tail", remote_job_id(job_id), lines)
+            if result["exit_code"] != 0:
+                return {"error_code": "unknown_id"}
+            return {"id": job_id, "log": result["stdout"]}
+        return guarded("job_tail", "job_tail_failed", run)
+
+    @mcp.tool()
+    def job_kill(job_id: str) -> dict:
+        """Stop a job: SIGTERM to its whole process group, SIGKILL after 5 s. Returns the final state (takes up to about 6 s)."""
+        def run():
+            [state] = remote.job_json("kill", remote_job_id(job_id))
+            return {"error_code": state["error"]} if "error" in state else _job_state(state)
+        return guarded("job_kill", "job_kill_failed", run)
+
+    @mcp.tool()
+    def job_list() -> dict:
+        """List all durable jobs of this account with their states (no command text)."""
+        def run():
+            result = remote.job_command("ls")
+            jobs = [_job_state(json.loads(line)) for line in result["stdout"].splitlines() if line.strip()]
+            return {"jobs": jobs}
+        return guarded("job_list", "job_list_failed", run)
+
+    @mcp.tool()
+    def push_start(local_path: str, remote_path: str, job_id: str | None = None) -> dict:
+        """Start a background rsync push of a workspace-relative file or directory to a path inside the remote home, returning a push_id at once. Resumable: re-running with a new job_id after a failure resends only missing or changed data. Afterwards the remote copy is independently checked against a local SHA-256 manifest. Poll push_status (every 10-60 s); do not block on it. Use this instead of put_file for large directories or many files."""
+        def run():
+            return start_push(remote, push_root, local_path, remote_path, job_id)
+        try:
+            result = run()
+            audit("push_start", True)
+            return result
+        except FileExistsError:
+            audit("push_start", False)
+            return {"error_code": "id_exists"}
+        except Exception:
+            audit("push_start", False)
+            return {"error_code": "push_start_failed"}
+
+    @mcp.tool()
+    def push_status(job_id: str) -> dict:
+        """Return push state immediately: starting, hashing, transferring, verifying, completed, failed (with a fixed reason code), cancelled, lost or unknown_id, plus byte/file progress and the verification summary (verified, failed, up to 5 failed relative paths). Only completed means the remote copy is verified."""
+        return guarded("push_status", "push_status_failed", lambda: read_push(push_root, job_id))
+
+    @mcp.tool()
+    def push_cancel(job_id: str) -> dict:
+        """Cancel a running push and its local rsync (takes up to about 5 s). Partial files are kept for a later resume."""
+        return guarded("push_cancel", "push_cancel_failed", lambda: cancel_push(push_root, job_id))
+
+    @mcp.tool()
+    def write_remote_file(remote_path: str, content: str, mode: int = 0o600) -> dict:
+        """Atomically create or replace a UTF-8 text file (at most 1 MB) inside the remote home: written to a temporary file, then renamed. Symbolic links and paths outside the home are refused. mode is numeric, e.g. 384 for 0600 or 448 for 0700. Use it for scripts and configs instead of shell heredocs."""
+        return guarded("write_remote_file", "remote_write_failed", lambda: remote.write_file(remote_path, content, mode))
+
+    @mcp.tool()
+    def read_remote_file(remote_path: str, max_bytes: int = 65536) -> dict:
+        """Read up to max_bytes (at most 1 MB) of a UTF-8 text file inside the remote home. Binary files are refused; use fetch_file for those. truncated=true when the file is longer."""
+        def run():
+            try:
+                return remote.read_file(remote_path, max_bytes)
+            except BinaryFileError:
+                return {"error_code": "binary_file"}
+        return guarded("read_remote_file", "remote_read_failed", run)
+
+
 def internal_mcp(private, target, job):
     private, settings, credentials, policy = load_settings(private)
     from .config import JOB_ID
@@ -324,9 +452,11 @@ def internal_mcp(private, target, job):
         with path.open("a") as stream:
             stream.write(json.dumps({"method": method, "success": success, "time": time.time()}) + "\n")
 
+    register_remote_tools(mcp, remote, private / "jobs" / job / "pushes", audit)
+
     @mcp.tool()
     def remote_exec(command: str, timeout_seconds: int = 120) -> dict:
-        """Execute a remote shell command. For persistent jobs use a durable remote supervisor; closing a channel does not guarantee termination."""
+        """Execute a short remote shell command (default 120 s, max 1 h, 256 KB output). Anything long-running (training, data processing, installs) must use job_start instead; closing this channel does not guarantee termination. Use it for quick probes such as `nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv`."""
         try:
             result = remote.execute(command, timeout_seconds)
             audit("remote_exec", result.get("exit_code") == 0)
@@ -337,7 +467,7 @@ def internal_mcp(private, target, job):
 
     @mcp.tool()
     def put_file(local_path: str, remote_path: str) -> dict:
-        """Upload a workspace-relative file or directory through the existing private connection. Preserves bytes and verifies hashes; already-matching files are skipped. No reverse connection or public endpoint is needed."""
+        """Upload a small workspace-relative file or directory through the existing private connection, blocking until done. Preserves bytes and verifies hashes; already-matching files are skipped. For large directories or many files use push_start, which returns immediately and reports progress."""
         try:
             result = remote.upload(local_path, remote_path)
             audit("put_file", True)
