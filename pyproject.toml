@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "private-codex-worker"
+name = "codex-ssh-worker"
 version = "0.1.0"
-description = "Private Codex task worker with a sanitized MCP boundary"
+description = "Delegate coding and execution tasks to a local Codex agent that works on a remote server over SSH"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.20,<2", "paramiko>=3.5,<5"]
 
