@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import traceback
 from pathlib import Path
 
 from .config import DEFAULT_PRIVATE, load_settings
@@ -43,6 +44,11 @@ def main():
                 result = redactor.clean(result)
             print(json.dumps(result, ensure_ascii=False, allow_nan=False))
     except Exception:
+        if args.mode == "serve":
+            # Only the daemon's stderr (the administrator's journal) gets the
+            # cause. The other modes' stderr can reach Claude or Codex, so they
+            # keep emitting just the fixed code.
+            traceback.print_exc(file=sys.stderr)
         print('{"error_code":"worker_operation_failed"}', file=sys.stderr)
         return 1
     return 0
