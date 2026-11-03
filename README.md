@@ -115,7 +115,11 @@ over-redacted. There is no promise that all location inference is prevented.
 The MCP client forwards only gateway responses. Neither raw stdout/stderr nor
 Codex event streams are forwarded. Exceptions and public MCP validation failures
 use fixed codes, suppressing exception text that could otherwise echo instructions
-or attachment contents. The gateway has an explicit RPC method allowlist;
+or attachment contents. A validation failure names only the declared parameter
+and a fixed reason, for example
+`{"error_code": "invalid_tool_request", "field": "attachments", "index": 0, "reason": "item_must_have_source_and_path"}`;
+caller-side attachment problems return `invalid_attachments` with the same
+`field`/`reason` shape. Input values and nested key names are never echoed. The gateway has an explicit RPC method allowlist;
 configuration and raw-log APIs do not exist.
 Tasks require a structured outcome as well as a report. A claimed success without
 successful private-tool evidence (remote operations or published local deliverables) becomes `blocked`, not `completed`.
@@ -152,6 +156,8 @@ keeping connection identity private.
 `source` is an absolute path on the caller's machine. `path` is the destination
 relative to the task workspace. A directory is recursive; optional `list_file`
 is a caller-local UTF-8 file listing exactly the relative files to include.
+Each item accepts only `source`, `path` and optional `list_file` (a string or
+`null`); other keys are rejected with reason `item_keys_must_be_source_path_list_file`.
 The caller opens local files using its own OS identity and streams the original
 bytes over the existing authenticated Unix socket. The service never opens an
 arbitrary caller-supplied local path. Inputs are checked with SHA256, privately

@@ -5,7 +5,8 @@ from typing import Annotated
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from pydantic import Field
+from pydantic import ConfigDict, Field, ValidationError
+from typing_extensions import NotRequired, TypedDict
 
 from .attachments import save_artifact, stage_inputs
 from .config import JOB_ID, load_settings
@@ -17,13 +18,69 @@ WAIT_SLICE_SECONDS = 20
 RECOVER = "Call wait_for_task with the same task_id. Do not resubmit the work."
 
 
+MAX_TASK_SECONDS = 604800
+TaskTimeout = Annotated[int | None, Field(strict=True, ge=1, le=MAX_TASK_SECONDS)]
+
+
+class Attachment(TypedDict):
+    """One caller file or directory to copy into the task workspace."""
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    source: Annotated[str, Field(description="Absolute caller-local path of a file or directory.")]
+    path: Annotated[str, Field(description="Workspace-relative destination, e.g. data/input.bin.")]
+    list_file: NotRequired[Annotated[str | None, Field(
+        description="Optional absolute caller-local UTF-8 file listing relative members of a directory source.")]]
+
+
+# Pydantic error types mapped to fixed reasons. Nothing from the input value,
+# and no nested key name (which could be caller data), ever reaches the reply.
+REASONS = {"missing": "required", "string_type": "must_be_string", "int_type": "must_be_integer",
+           "int_parsing": "must_be_integer", "int_from_float": "must_be_integer",
+           "bool_type": "must_be_boolean", "list_type": "must_be_list", "dict_type": "must_be_object",
+           "greater_than_equal": "below_minimum", "less_than_equal": "above_maximum",
+           "extra_forbidden": "unexpected_key", "json_invalid": "invalid_json"}
+
+
+def validation_reason(tool, error):
+    parameters = set(tool.parameters.get("properties", {})) if tool is not None else set()
+    details = error.errors(include_url=False, include_input=False, include_context=False)
+    if not details:
+        return {"error_code": "invalid_tool_request", "reason": "invalid_arguments"}
+    first = details[0]
+    location = [part for part in first.get("loc", ()) if part != "arguments"]
+    reason = REASONS.get(first.get("type"), "invalid_value")
+    result = {"error_code": "invalid_tool_request", "reason": reason}
+    if location and isinstance(location[0], str) and location[0] in parameters:
+        result["field"] = location[0]
+        if location[0] == "attachments" and len(location) > 1:
+            if isinstance(location[1], int):
+                result["index"] = location[1]
+            if reason == "unexpected_key":
+                result["reason"] = "item_keys_must_be_source_path_list_file"
+            elif reason == "required":
+                result["reason"] = "item_must_have_source_and_path"
+            elif len(location) == 2:
+                result["reason"] = "item_must_be_object"
+            else:
+                result["reason"] = "item_values_must_be_strings"
+    return result
+
+
 class PublicMCP(FastMCP):
     async def call_tool(self, name, arguments):
+        tool = self._tool_manager.get_tool(name)
+        if tool is None:
+            raise ToolError(json.dumps({"error_code": "invalid_tool_request", "reason": "unknown_tool"}))
         try:
             return await super().call_tool(name, arguments)
-        except Exception:
-            # SDK validation errors can echo entire instructions or attachments.
-            raise ToolError("invalid_tool_request") from None
+        except Exception as error:
+            # SDK validation errors can echo entire instructions or attachments,
+            # so only fixed reason codes and declared parameter names leave here.
+            cause = error.__cause__ if isinstance(error.__cause__, ValidationError) else None
+            if cause is None and isinstance(error, ValidationError):
+                cause = error
+            detail = validation_reason(tool, cause) if cause is not None else {
+                "error_code": "invalid_tool_request", "reason": "tool_failed"}
+            raise ToolError(json.dumps(detail)) from None
 
 
 def detached(task_id, **details):
@@ -91,7 +148,8 @@ async def wait_for_completion(call, task_id, context, timeout_seconds):
         return detached(task_id, error_code="wait_failed")
 
 
-async def run_and_wait(call, target, instruction, files, context, timeout_seconds, input_id=None):
+async def run_and_wait(call, target, instruction, files, context, timeout_seconds, input_id=None,
+                       task_timeout_seconds=None):
     if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 604800:
         return {"error_code": "invalid_wait_timeout"}
 
@@ -99,6 +157,8 @@ async def run_and_wait(call, target, instruction, files, context, timeout_second
         arguments = {"target": target, "instruction": instruction, "files": files}
         if input_id is not None:
             arguments["input_id"] = input_id
+        if task_timeout_seconds is not None:
+            arguments["timeout_seconds"] = task_timeout_seconds
         result = await call("submit_task", **arguments)
         identifier = result.get("job_id") if isinstance(result, dict) else None
         if isinstance(identifier, str) and JOB_ID.fullmatch(identifier):
@@ -150,7 +210,7 @@ async def file_operation(function, context, *arguments):
 
 
 def create_public_mcp(socket_path):
-    mcp = PublicMCP("codex-worker", instructions="Delegate arbitrary execution tasks to a logical resource. Prefer run_task for new work: it submits once and waits for the filtered terminal report. For an existing job_id, call wait_for_task once with it as task_id; do not poll or resubmit. Use list_tasks to recover missing IDs; authorized clients of the same socket share tasks, without session isolation. After submit_task or continue_task, attach with wait_for_task. Call long waits from the main conversation so the host can background them when supported; this is not native MCP Tasks or unsolicited push. partial, blocked, failed, timed_out, interrupted, and cancelled are terminal outcomes, not successful completion. Never automatically retry side-effecting work or suppress intentional reruns. Do not request infrastructure identity, private worker configuration, or deployment locations. Resource environment and software capabilities may be queried. Raw logs are not exposed. Cancelling a wait only stops waiting; cancel_task stops the local agent, not necessarily remote background processes." + " This is a general-purpose Codex agent, not a catalogue of business-specific actions. Attach caller files using attachments=[{source: absolute local path, path: workspace-relative destination}]. Directories are recursive; optional list_file is a caller-local UTF-8 list of relative files to include. These bytes travel directly to the worker, outside the model context. Use existing run_task/submit_task/continue_task for any authorized coding, analysis or execution work. To retrieve an original binary or large deliverable, call get_artifact with an absolute caller-local destination; sensitive artifacts are held. Do not ask for private server addresses or attempt reverse connections to transfer files.")
+    mcp = PublicMCP("codex-worker", instructions="Delegate arbitrary execution tasks to a logical resource. Prefer run_task for new work: it submits once and waits for the filtered terminal report. For an existing job_id, call wait_for_task once with it as task_id; do not poll or resubmit. Use list_tasks to recover missing IDs; authorized clients of the same socket share tasks, without session isolation. After submit_task or continue_task, attach with wait_for_task. Call long waits from the main conversation so the host can background them when supported; this is not native MCP Tasks or unsolicited push. partial, blocked, failed, timed_out, interrupted, and cancelled are terminal outcomes, not successful completion. Never automatically retry side-effecting work or suppress intentional reruns. Do not request infrastructure identity, private worker configuration, or deployment locations. Resource environment and software capabilities may be queried. Raw logs are not exposed. Cancelling a wait only stops waiting; cancel_task stops the local agent, not necessarily remote background processes." + " This is a general-purpose Codex agent, not a catalogue of business-specific actions. Attach caller files using attachments=[{source: absolute local path, path: workspace-relative destination, list_file?: absolute local list file}] on run_task, submit_task or continue_task. Directories are recursive; optional list_file is a caller-local UTF-8 list of relative files to include. These bytes travel directly to the worker, outside the model context. Use existing run_task/submit_task/continue_task for any authorized coding, analysis or execution work. To retrieve an original binary or large deliverable, call get_artifact with an absolute caller-local destination; sensitive artifacts are held. Do not ask for private server addresses or attempt reverse connections to transfer files.")
 
     async def call(method, **arguments):
         return await gateway_call(socket_path, method, **arguments)
@@ -169,14 +229,16 @@ def create_public_mcp(socket_path):
     @mcp.tool()
     async def run_task(target: str, instruction: str, ctx: Context, files: dict[str, str] | None = None,
                        timeout_seconds: Annotated[int, Field(strict=True)] = 86400,
-                       attachments: list[dict[str, str]] | None = None) -> dict:
-        """Preferred for new free-form work: submit once, publish the opaque job_id, then wait for its filtered report. Inputs and business output remain flexible. Timeout/cancellation only detaches; recover with wait_for_task or list_tasks, never automatic resubmission. Default wait 24 hours, maximum 7 days; host call limits still apply."""
+                       attachments: list[Attachment] | None = None,
+                       task_timeout_seconds: TaskTimeout = None) -> dict:
+        """Preferred for new free-form work: submit once, publish the opaque job_id, then wait for its filtered report. Parameters: target is a logical resource name from list_resources; instruction is free text; files is an optional object of workspace-relative path -> UTF-8 text; attachments is an optional list [{source: absolute caller-local path, path: workspace-relative destination, list_file?: absolute caller-local UTF-8 list of relative members (directory sources only)}], copied as real bytes outside the model context. timeout_seconds bounds only this wait (integer seconds, default 24 hours, maximum 7 days); task_timeout_seconds is the optional execution limit after which the task is stopped (integer 1-604800, default from worker settings). Timeout/cancellation of the wait only detaches; recover with wait_for_task or list_tasks, never automatic resubmission. Host call limits still apply. Validation errors return a fixed error_code, field and reason, never your input."""
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 604800:
             return {"error_code": "invalid_wait_timeout"}
         staged = await inputs(attachments, ctx)
         if "error_code" in staged:
             return staged
-        return await run_and_wait(call, target, instruction, files, ctx, timeout_seconds, staged.get("input_id"))
+        return await run_and_wait(call, target, instruction, files, ctx, timeout_seconds, staged.get("input_id"),
+                                  task_timeout_seconds)
 
     @mcp.tool()
     async def list_tasks(target: str | None = None, status: str | None = None,
@@ -186,19 +248,22 @@ def create_public_mcp(socket_path):
 
     @mcp.tool()
     async def submit_task(target: str, instruction: str, files: dict[str, str] | None = None,
-                          attachments: list[dict[str, str]] | None = None) -> dict:
-        """Submit arbitrary work, returning immediately. Next call wait_for_task with job_id; do not poll. Inputs are unchanged."""
+                          attachments: list[Attachment] | None = None,
+                          timeout_seconds: TaskTimeout = None) -> dict:
+        """Submit arbitrary work, returning immediately. Next call wait_for_task with job_id; do not poll. Inputs are unchanged. Parameters: target is a logical resource name from list_resources; instruction is free text; files is an optional object of workspace-relative path -> UTF-8 text; attachments is an optional list [{source: absolute caller-local path, path: workspace-relative destination, list_file?: absolute caller-local UTF-8 list of relative members (directory sources only)}], copied as real bytes outside the model context. timeout_seconds is the optional execution limit (integer 1-604800, default from worker settings); the task is stopped and reported timed_out when it expires."""
         staged = await inputs(attachments)
         if "error_code" in staged:
             return staged
         arguments = {"target": target, "instruction": instruction, "files": files}
+        if timeout_seconds is not None:
+            arguments["timeout_seconds"] = timeout_seconds
         if "input_id" in staged:
             arguments["input_id"] = staged["input_id"]
         return await call("submit_task", **arguments)
 
     @mcp.tool()
     async def get_task(task_id: str) -> dict:
-        """Get durable task state; raw progress and logs remain private."""
+        """Get durable task state for a job_id: status, timestamps, and progress (the agent's own filtered short progress note, with progress_updated_at) when available. Raw logs remain private."""
         return await call("get_task", task_id=task_id)
 
     @mcp.tool()
@@ -213,12 +278,15 @@ def create_public_mcp(socket_path):
 
     @mcp.tool()
     async def continue_task(task_id: str, instruction: str, files: dict[str, str] | None = None,
-                            attachments: list[dict[str, str]] | None = None) -> dict:
-        """Create a follow-up with prior private report and a new workspace. Next call wait_for_task with its new job_id."""
+                            attachments: list[Attachment] | None = None,
+                            timeout_seconds: TaskTimeout = None) -> dict:
+        """Create a follow-up of a finished task with its prior private report and a new workspace. Next call wait_for_task with its new job_id. task_id is a job_id; files, attachments and timeout_seconds have the same format as submit_task."""
         staged = await inputs(attachments)
         if "error_code" in staged:
             return staged
         arguments = {"task_id": task_id, "instruction": instruction, "files": files}
+        if timeout_seconds is not None:
+            arguments["timeout_seconds"] = timeout_seconds
         if "input_id" in staged:
             arguments["input_id"] = staged["input_id"]
         return await call("continue_task", **arguments)
