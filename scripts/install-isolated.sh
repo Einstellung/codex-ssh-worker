@@ -100,7 +100,10 @@ UMask=0077
 ExecStart=/opt/codex-worker/venv/bin/python -m codex_worker.cli serve --private-dir=/var/lib/codex-worker --socket=/run/codex-worker/worker.sock
 Restart=on-failure
 RestartSec=5
-KillMode=control-group
+# Stopping or restarting the service must not kill delegated Codex tasks: they
+# run in their own sessions, record their exit status, and the next service
+# instance adopts them. control-group would kill the whole cgroup, tasks included.
+KillMode=process
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
