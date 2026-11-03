@@ -288,3 +288,16 @@ def test_sigterm_to_real_service_leaves_task_running(private):
     until(lambda: (path / 'exit').exists())
     start(root, workers)
     assert state(root, identifier)['status'] == 'completed'
+
+
+def test_second_service_instance_does_not_adopt(private, monkeypatch):
+    from codex_worker import service
+    root, workers, extra = private
+    socket_path = root / 'test.sock'
+    first = subprocess.Popen([sys.executable, '-m', 'codex_worker.cli', 'serve', '--private-dir', str(root),
+                              '--socket', str(socket_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    extra.append(first)
+    until(socket_path.exists)
+    monkeypatch.setattr(service, 'Worker', lambda *args: pytest.fail('adopted while another instance serves'))
+    with pytest.raises(RuntimeError):
+        service.serve(root, socket_path)

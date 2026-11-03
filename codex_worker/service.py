@@ -434,7 +434,6 @@ class Worker:
 
 def serve(private, socket_path):
     os.umask(0o077)
-    worker = Worker(private)
     socket_path = Path(socket_path)
     if socket_path.exists():
         connection = socket.socket(socket.AF_UNIX)
@@ -446,6 +445,9 @@ def serve(private, socket_path):
             raise RuntimeError("worker already running")
         finally:
             connection.close()
+    # Adoption starts queued jobs and watchers, so it must only happen once
+    # no other instance is serving this private directory.
+    worker = Worker(private)
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
