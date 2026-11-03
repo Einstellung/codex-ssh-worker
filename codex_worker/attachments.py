@@ -23,6 +23,14 @@ CHUNK = 1024 * 1024
 RESERVED = {"agents.md", "agents.override.md", ".codex"}
 
 
+class AttachmentError(ValueError):
+    """A caller-side attachment problem with a fixed, data-free reason code."""
+
+    def __init__(self, reason, index=None):
+        super().__init__(reason)
+        self.reason, self.index = reason, index
+
+
 def relative_name(value):
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError("invalid attachment name")
@@ -56,53 +64,74 @@ def open_regular(path):
 
 def collect_inputs(attachments):
     if not isinstance(attachments, list) or not attachments:
-        raise ValueError("attachments required")
+        raise AttachmentError("must_be_non_empty_list")
     entries = []
     names = set()
-    for attachment in attachments:
+    for index, attachment in enumerate(attachments):
         if not isinstance(attachment, dict) or set(attachment) - {"source", "path", "list_file"}:
-            raise ValueError("invalid attachment")
+            raise AttachmentError("item_keys_must_be_source_path_list_file", index)
+        if not isinstance(attachment.get("source"), str) or not isinstance(attachment.get("path"), str):
+            raise AttachmentError("item_must_have_source_and_path", index)
         source = Path(attachment["source"])
-        destination = relative_name(attachment["path"])
-        if not source.is_absolute() or source.is_symlink():
-            raise ValueError("absolute caller path required")
+        try:
+            destination = relative_name(attachment["path"])
+        except ValueError:
+            raise AttachmentError("path_must_be_workspace_relative_and_not_reserved", index) from None
+        if not source.is_absolute():
+            raise AttachmentError("source_must_be_absolute", index)
+        if source.is_symlink():
+            raise AttachmentError("source_must_not_be_symlink", index)
+        if not source.exists():
+            raise AttachmentError("source_not_found", index)
         if source.is_dir():
             if attachment.get("list_file"):
                 with open_regular(attachment["list_file"]) as stream:
                     selected = stream.read().decode("utf-8-sig").splitlines()
-                members = [relative_name(value) for value in selected]
+                try:
+                    members = [relative_name(value) for value in selected]
+                except ValueError:
+                    raise AttachmentError("list_file_entries_must_be_relative", index) from None
             else:
                 members = []
                 for directory, directories, files in os.walk(source, followlinks=False):
                     for name in directories:
                         if (Path(directory) / name).is_symlink():
-                            raise ValueError("attachment links are not supported")
+                            raise AttachmentError("directory_links_not_supported", index)
                     members.extend((Path(directory) / name).relative_to(source).as_posix()
                                    for name in sorted(files))
             selected_entries = [(source / member, relative_name(destination + "/" + member))
                                 for member in sorted(members)]
         else:
             if attachment.get("list_file"):
-                raise ValueError("list_file requires a directory")
+                raise AttachmentError("list_file_requires_directory_source", index)
             selected_entries = [(source, destination)]
         for local, name in selected_entries:
             if name in names or any(parent.as_posix() in names for parent in PurePosixPath(name).parents):
-                raise ValueError("duplicate attachment destination")
+                raise AttachmentError("duplicate_destination", index)
             if any(existing.startswith(name + "/") for existing in names):
-                raise ValueError("conflicting attachment destination")
-            with open_regular(local) as stream:
-                size = os.fstat(stream.fileno()).st_size
+                raise AttachmentError("conflicting_destination", index)
+            try:
+                with open_regular(local) as stream:
+                    size = os.fstat(stream.fileno()).st_size
+            except (OSError, ValueError):
+                raise AttachmentError("source_must_be_regular_readable_file", index) from None
             entries.append((local, name, size))
             names.add(name)
     if not entries:
-        raise ValueError("no input files")
+        raise AttachmentError("no_files_selected")
     return entries
 
 
 def stage_inputs(socket_path, attachments):
     """Called as the caller's OS identity. File bytes never enter model output."""
     try:
-        entries = collect_inputs(attachments)
+        try:
+            entries = collect_inputs(attachments)
+        except AttachmentError as error:
+            result = {"error_code": "invalid_attachments", "field": "attachments", "reason": error.reason}
+            if error.index is not None:
+                result["index"] = error.index
+            return result
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(60)
             connection.connect(str(socket_path))

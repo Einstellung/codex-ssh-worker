@@ -99,7 +99,8 @@ over-redacted. There is no promise that all location inference is prevented.
 - `submit_task(target, instruction, files?)`: enqueue a free-form task. Optional
   files are UTF-8 text keyed by workspace-relative filename; they are unchanged.
   This immediate-return tool remains available for existing clients.
-- `get_task(task_id)`: queued/running/terminal state, not raw execution logs.
+- `get_task(task_id)`: queued/running/terminal state plus the agent's filtered
+  `progress` note when present; not raw execution logs.
 - `get_result(task_id)`: filtered final report and opaque artifact IDs.
 - `wait_for_task(task_id, timeout_seconds=86400)`: attach once and receive the
   same filtered terminal report as `get_result`, without repeated model tool
@@ -109,13 +110,18 @@ over-redacted. There is no promise that all location inference is prevented.
   files remain available according to the task's permissions.
 - `get_artifact(task_id, artifact_id)`: filtered UTF-8 preview up to 1 MiB;
   larger/binary previews remain private; provide a caller-local `destination` to save an inspected original file.
-- `cancel_task(task_id)`: terminates the local Codex process group only. It does
+- `cancel_task(task_id)`: terminates the local Codex process group only, including
+  tasks adopted after a service restart (SIGTERM, then SIGKILL after 5 seconds). It does
   **not** guarantee remote processes stopped; delegate a remote stop separately.
 
 The MCP client forwards only gateway responses. Neither raw stdout/stderr nor
 Codex event streams are forwarded. Exceptions and public MCP validation failures
 use fixed codes, suppressing exception text that could otherwise echo instructions
-or attachment contents. The gateway has an explicit RPC method allowlist;
+or attachment contents. A validation failure names only the declared parameter
+and a fixed reason, for example
+`{"error_code": "invalid_tool_request", "field": "attachments", "index": 0, "reason": "item_must_have_source_and_path"}`;
+caller-side attachment problems return `invalid_attachments` with the same
+`field`/`reason` shape. Input values and nested key names are never echoed. The gateway has an explicit RPC method allowlist;
 configuration and raw-log APIs do not exist.
 Tasks require a structured outcome as well as a report. A claimed success without
 successful private-tool evidence (remote operations or published local deliverables) becomes `blocked`, not `completed`.
@@ -125,9 +131,32 @@ against a malicious worker that can modify its own audit file.
 Every response passes through a new redactor, so aliases are consistent within
 that response but not across separate requests. Original business data and
 privately stored artifacts remain unchanged. Reports are generated on retrieval,
-so current policy also applies to old jobs. On service restart, active agent
-tasks become `interrupted`; remote durable jobs may still be running. Never
-automatically retry a side-effecting task without checking its prior effects.
+so current policy also applies to old jobs.
+
+Agent tasks outlive the service. Each `codex exec` runs in its own session under
+a small `sh` wrapper that feeds the prompt from a file and writes the exit
+status to the job's `exit` file, so the status is recorded even while no service
+is running. The job's `process.json` holds the wrapper pid and its kernel start
+time from `/proc/<pid>/stat`. Stopping or restarting the service kills no task
+(the systemd unit uses `KillMode=process`). On startup the service adopts every
+unfinished job: if the recorded pid still runs with the same start time, the job
+stays `running` and is watched to completion; if it has exited, the `exit` file
+decides the outcome through the same report and evidence checks; with no `exit`
+file the job becomes `interrupted` with `error_code: "lost"`, never `completed`.
+Queued jobs that never started are started by the new instance. A reused pid
+(different start time) is never adopted or signalled. Remote durable jobs are
+unaffected either way. Never automatically retry a side-effecting task without
+checking its prior effects.
+
+`submit_task`/`continue_task` accept `timeout_seconds` and `run_task` accepts
+`task_timeout_seconds`: the execution limit, integer 1 to 604800 seconds
+(7 days), defaulting to `task_timeout_seconds` in `resources.json`. When it
+expires the task's process group receives SIGTERM, then SIGKILL after 5 seconds,
+and the task becomes `timed_out`. The limit is kept across service restarts.
+
+While a task runs, the agent may keep a short status in `progress.txt` at the
+workspace root. `get_task` returns its first 2 KB as `progress` (filtered by the
+same redactor) with `progress_updated_at`; symlinks are ignored.
 
 ## General-purpose task files
 
@@ -152,6 +181,8 @@ keeping connection identity private.
 `source` is an absolute path on the caller's machine. `path` is the destination
 relative to the task workspace. A directory is recursive; optional `list_file`
 is a caller-local UTF-8 file listing exactly the relative files to include.
+Each item accepts only `source`, `path` and optional `list_file` (a string or
+`null`); other keys are rejected with reason `item_keys_must_be_source_path_list_file`.
 The caller opens local files using its own OS identity and streams the original
 bytes over the existing authenticated Unix socket. The service never opens an
 arbitrary caller-supplied local path. Inputs are checked with SHA256, privately
@@ -285,22 +316,26 @@ binary matches its source package before copying the helper. No credentials,
 worker policy, service state, or remote configuration are changed.
 
 For the run-and-wait and task-list source update, review `scripts/update-isolated.sh`.
-Finish active tasks and pause new submissions before running:
+Running tasks no longer need to finish first:
 
 ```bash
 sudo bash scripts/update-isolated.sh --apply
 ```
 
-It checks for active tasks before and after staging and refuses if it sees any,
-backs up the code, updates the worker code modules and this README in
+It makes sure the unit uses `KillMode=process` (adding the drop-in
+`/etc/systemd/system/codex-worker.service.d/killmode.conf` and running
+`systemctl daemon-reload` if it does not), prints how many tasks are queued or
+running, backs up the code, updates the worker code modules and this README in
 the installed source (and the modules in the Python package), and restarts the
-local service. Unreadable or malformed task state also causes refusal.
+local service. Running tasks keep running and are adopted by the restarted
+service. One exception: if the installed code predates task adoption, stopping
+it would still kill its tasks, so the script refuses while any are active.
+Submissions sent while the service is down fail with `worker_unavailable`.
 On a command failure it attempts rollback and restart. It does not replace
 private configuration, credentials, Codex authentication, saved jobs, dependencies,
 or remote configuration. Reconnect the MCP server from Claude's `/mcp` afterward
 to load the new tools and instructions. Do not run the original installer over an
-existing installation. Any service restart can interrupt work submitted during
-an update, so these active-task checks are not a maintenance lock.
+existing installation.
 
 ```bash
 sudo --preserve-env=HTTP_PROXY,HTTPS_PROXY,ALL_PROXY,NO_PROXY,http_proxy,https_proxy,all_proxy,no_proxy bash scripts/install-isolated.sh

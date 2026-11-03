@@ -644,34 +644,46 @@ def test_run_attaches_after_acknowledged_submission_error():
     assert calls == ['submit_task', 'wait_for_task']
 
 
-@pytest.mark.parametrize('status', ['queued', 'running', 'completed', 'partial', 'blocked',
-                                   'failed', 'timed_out', 'interrupted', 'cancelled', 'unknown', None])
-def test_admin_update_idle_check_refuses_active_or_unknown_state(tmp_path, status):
-    # Run only the script's actual read-only preflight, against synthetic local
-    # history. Do not execute the privileged deployment script or service calls.
+def update_count_script():
     script = Path('scripts/update-isolated.sh').read_text()
-    check = script.split('check_idle() {', 1)[1].split("<<'PY'\n", 1)[1].split('\nPY', 1)[0]
-    history = tmp_path / 'jobs'
-    job = history / ('job_' + 'a' * 24)
+    return script.split('count_active() {', 1)[1].split("<<'PY'\n", 1)[1].split('\nPY', 1)[0]
+
+
+@pytest.mark.parametrize('status', ['queued', 'running', 'completed', 'interrupted', 'unknown', None])
+def test_admin_update_counts_active_tasks_without_refusing(tmp_path, status):
+    # Run only the script's read-only counter against synthetic history. Do not
+    # execute the privileged deployment script or any service call.
+    job = tmp_path / 'jobs' / ('job_' + 'a' * 24)
     job.mkdir(parents=True)
-    atomic_json(job / 'state.json', {'status': status})
-    result = subprocess.run([sys.executable, '-c', check, str(history)], capture_output=True, text=True)
-    terminal = {'completed', 'partial', 'blocked', 'failed', 'timed_out', 'interrupted', 'cancelled'}
-    assert (result.returncode == 0) == (status in terminal)
-    assert str(history) not in result.stdout + result.stderr
-    assert json.loads((job / 'state.json').read_text()) == {'status': status}
+    atomic_json(job / 'state.json', {'status': status, 'detail': 'private detail'})
+    result = subprocess.run([sys.executable, '-c', update_count_script(), str(tmp_path / 'jobs')],
+                            capture_output=True, text=True)
+    assert result.returncode == 0
+    active = status not in {'completed', 'interrupted'}
+    assert ('1 task(s) are queued or running' in result.stdout) == active
+    assert str(tmp_path) not in result.stdout + result.stderr
+    assert 'private detail' not in result.stdout
 
 
-def test_admin_update_idle_check_fails_closed_without_raw_errors(tmp_path):
-    script = Path('scripts/update-isolated.sh').read_text()
-    check = script.split('check_idle() {', 1)[1].split("<<'PY'\n", 1)[1].split('\nPY', 1)[0]
+def test_admin_update_counter_tolerates_damaged_history(tmp_path):
     job = tmp_path / ('job_' + 'a' * 24)
     job.mkdir()
     (job / 'state.json').write_text('private invalid history')
-    result = subprocess.run([sys.executable, '-c', check, str(tmp_path)], capture_output=True, text=True)
-    assert result.returncode != 0
-    assert result.stderr.strip() == 'Task history could not be checked; refusing the update.'
-    assert not result.stdout
+    result = subprocess.run([sys.executable, '-c', update_count_script(), str(tmp_path)], capture_output=True, text=True)
+    assert result.returncode == 0
+    assert 'could not be counted' in result.stdout
+    assert 'private invalid history' not in result.stdout + result.stderr
+
+
+def test_scripts_keep_tasks_alive_across_restarts():
+    install = Path('scripts/install-isolated.sh').read_text()
+    update = Path('scripts/update-isolated.sh').read_text()
+    assert 'KillMode=process' in install and 'KillMode=control-group\n' not in install
+    assert '/etc/systemd/system/codex-worker.service.d/killmode.conf' in update
+    assert update.index('ensure_killmode\n') < update.index('systemctl stop codex-worker.service')
+    assert 'processes.py' in update.split('modules=(', 1)[1].split(')', 1)[0]
+    for script in ('install-isolated.sh', 'update-isolated.sh', 'repair-isolated.sh'):
+        subprocess.run(['bash', '-n', 'scripts/' + script], check=True)
 
 
 def test_new_public_schemas_preserve_compatible_tools_and_hide_context():
