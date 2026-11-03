@@ -1,4 +1,4 @@
-# Private Codex Worker
+# codex-ssh-worker
 
 Claude delegates unrestricted natural-language tasks to a configured logical
 resource. A private Codex worker resolves that resource and uses SSH without
