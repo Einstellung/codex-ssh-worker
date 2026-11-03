@@ -26,27 +26,35 @@ class Remote:
         self.workspace = workspace
         self.job = job
 
-    def connect(self):
+    def source_address(self):
+        """Local address to bind, shared by paramiko and the OpenSSH push channel."""
         resource = self.resource
-        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        connection.settimeout(15)
         if resource.get("source_interface"):
             interface_name = resource["source_interface"]
             if interface_name == "auto":
                 routes = json.loads(subprocess.check_output(["ip", "-j", "-4", "route", "show", "table", "main"], stderr=subprocess.DEVNULL))
                 candidates = [route for route in routes if route.get("dst") == "default" and route.get("dev") not in ("Mihomo", "tailscale0", "lo")]
                 if not candidates:
-                    connection.close()
                     raise ValueError("physical default route unavailable")
                 interface_name = min(candidates, key=lambda route: route.get("metric", 0))["dev"]
             interfaces = json.loads(subprocess.check_output(["ip", "-j", "-4", "addr", "show", "dev", interface_name], stderr=subprocess.DEVNULL))
             addresses = [address["local"] for interface in interfaces for address in interface.get("addr_info", []) if address.get("scope") == "global"]
             if not addresses:
-                connection.close()
                 raise ValueError("source interface unavailable")
-            connection.bind((addresses[0], 0))
-        elif resource.get("bind_address"):
-            connection.bind((resource["bind_address"], 0))
+            return addresses[0]
+        return resource.get("bind_address")
+
+    def connect(self):
+        resource = self.resource
+        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        connection.settimeout(15)
+        try:
+            address = self.source_address()
+            if address:
+                connection.bind((address, 0))
+        except BaseException:
+            connection.close()
+            raise
         client = paramiko.SSHClient()
         try:
             connection.connect((resource["host"], resource["port"]))
@@ -62,11 +70,15 @@ class Remote:
             connection.close()
             raise
 
-    def execute(self, command, timeout=120, max_bytes=262144):
+    def execute(self, command, timeout=120, max_bytes=262144, stdin=None):
         timeout = max(1, min(int(timeout), 3600))
         with self.connect() as client:
             channel = client.get_transport().open_session(timeout=15)
             channel.exec_command(command)
+            if stdin is not None:
+                # Untrusted text travels as data on stdin, never inside the command line.
+                channel.sendall(stdin)
+                channel.shutdown_write()
             output = bytearray()
             errors = bytearray()
             deadline = time.monotonic() + timeout
@@ -119,7 +131,12 @@ class Remote:
                 checked.add(directory)
             directory = posixpath.dirname(directory)
         for directory in reversed(missing):
-            sftp.mkdir(directory, mode=0o700)
+            try:
+                sftp.mkdir(directory, mode=0o700)
+            except OSError:
+                # A concurrent call may have created it first; accept only a real directory.
+                if not stat.S_ISDIR(sftp.lstat(directory).st_mode):
+                    raise ValueError("remote directory is not a regular directory") from None
             checked.add(directory)
 
     @staticmethod
@@ -239,3 +256,145 @@ print(json.dumps(matches))
         finally:
             if not complete:
                 destination.unlink(missing_ok=True)
+
+    # ---- remote tools, files and durable jobs -------------------------------
+
+    JOB_TOOL = "~/.local/bin/codex-job"
+    MAX_REMOTE_FILE = 1024 * 1024
+
+    @staticmethod
+    def home_path(sftp, remote_path, allow_missing=True):
+        """Resolve a path inside the remote home and refuse symbolic link components."""
+        if not isinstance(remote_path, str) or not remote_path or "\0" in remote_path:
+            raise ValueError("remote path required")
+        relative = remote_path[2:] if remote_path.startswith("~/") else remote_path
+        if relative == "~":
+            relative = "."  # the home itself, refused below; never a file named "~"
+        home = sftp.normalize(".")
+        target = posixpath.normpath(posixpath.join(home, relative))
+        if not target.startswith(home.rstrip("/") + "/"):
+            raise ValueError("remote path must stay inside the home directory")
+        current = home
+        for part in posixpath.relpath(target, home).split("/"):
+            current = posixpath.join(current, part)
+            try:
+                mode = sftp.lstat(current).st_mode
+            except FileNotFoundError:
+                if not allow_missing:
+                    raise
+                break
+            if stat.S_ISLNK(mode):
+                raise ValueError("remote symbolic links are not followed")
+        return home, target
+
+    def check_home_path(self, remote_path):
+        """Fail unless remote_path stays in the home without symbolic link components."""
+        with self.connect() as client, client.open_sftp() as sftp:
+            self.home_path(sftp, remote_path)
+
+    def ensure_remote_tools(self):
+        """Install codex-job into ~/.local/bin once; overwrite only when the digest differs."""
+        if getattr(self, "_tools_ready", False):
+            return False
+        script = (Path(__file__).with_name("remote_job.sh")).read_bytes()
+        wanted = hashlib.sha256(script).hexdigest()
+        changed = False
+        with self.connect() as client, client.open_sftp() as sftp:
+            home, target = self.home_path(sftp, ".local/bin/codex-job")
+            current = None
+            try:
+                if stat.S_ISREG(sftp.lstat(target).st_mode):
+                    with sftp.open(target, "rb") as stream:
+                        current = hashlib.sha256(stream.read(4 * 1024 * 1024)).hexdigest()
+            except FileNotFoundError:
+                pass
+            if current != wanted:
+                self._mkdirs(sftp, posixpath.dirname(target), {home})
+                self._atomic_put(sftp, target, script, 0o700)
+                changed = True
+        self._tools_ready = True
+        return changed
+
+    @staticmethod
+    def _atomic_put(sftp, target, data, mode):
+        temporary = target + ".worker-" + uuid.uuid4().hex
+        try:
+            with sftp.open(temporary, "wb") as stream:
+                # The server creates the file with its umask (often 0644) on a shared
+                # host; restrict it before any byte is written.
+                sftp.chmod(temporary, 0o600)
+                stream.write(data)
+            sftp.chmod(temporary, mode)
+            sftp.posix_rename(temporary, target)
+        finally:
+            try:
+                sftp.remove(temporary)
+            except (FileNotFoundError, OSError):
+                pass
+
+    def write_file(self, remote_path, content, mode=0o600):
+        if not isinstance(content, (str, bytes)):
+            raise ValueError("text content required")
+        data = content.encode() if isinstance(content, str) else content
+        if len(data) > self.MAX_REMOTE_FILE:
+            raise ValueError("content too large")
+        # Group/other write on a shared host would let another account alter scripts.
+        if type(mode) is not int or not 0 <= mode <= 0o777 or mode & 0o022:
+            raise ValueError("invalid mode")
+        with self.connect() as client, client.open_sftp() as sftp:
+            home, target = self.home_path(sftp, remote_path)
+            try:
+                if not stat.S_ISREG(sftp.lstat(target).st_mode):
+                    raise ValueError("remote target is not a regular file")
+            except FileNotFoundError:
+                pass
+            self._mkdirs(sftp, posixpath.dirname(target), {home})
+            self._atomic_put(sftp, target, data, mode)
+        return {"written": True, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+    def read_file(self, remote_path, max_bytes=65536):
+        if type(max_bytes) is not int or not 1 <= max_bytes <= self.MAX_REMOTE_FILE:
+            raise ValueError("invalid max_bytes")
+        with self.connect() as client, client.open_sftp() as sftp:
+            home, target = self.home_path(sftp, remote_path, allow_missing=False)
+            info = sftp.lstat(target)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("remote target is not a regular file")
+            with sftp.open(target, "rb") as stream:
+                data = stream.read(max_bytes + 1)
+        truncated = len(data) > max_bytes
+        data = data[:max_bytes]
+        if b"\0" in data:
+            raise BinaryFileError("binary file")
+        # A cut may split one multi-byte character; only those last 1-3 bytes may go.
+        for drop in range(4 if truncated else 1):
+            try:
+                text = data[:len(data) - drop].decode()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            raise BinaryFileError("binary file")
+        return {"content": text, "size_bytes": info.st_size, "truncated": truncated}
+
+    def job_command(self, *arguments, stdin=None, timeout=60):
+        self.ensure_remote_tools()
+        command = self.JOB_TOOL + " " + " ".join(shlex.quote(str(argument)) for argument in arguments)
+        result = self.execute(command, timeout=timeout, max_bytes=1024 * 1024, stdin=stdin)
+        if result["exit_code"] == 127 and not result["stdout"]:
+            # The cached install was removed on the server: reinstall once and retry.
+            self._tools_ready = False
+            if self.ensure_remote_tools():
+                result = self.execute(command, timeout=timeout, max_bytes=1024 * 1024, stdin=stdin)
+        return result
+
+    def job_json(self, *arguments, stdin=None, timeout=60):
+        result = self.job_command(*arguments, stdin=stdin, timeout=timeout)
+        lines = [json.loads(line) for line in result["stdout"].splitlines() if line.strip()]
+        if not lines or not all(isinstance(line, dict) for line in lines):
+            raise ValueError("invalid job response")
+        return lines
+
+
+class BinaryFileError(ValueError):
+    pass
