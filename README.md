@@ -23,6 +23,25 @@ environment, reserve GPUs across other users' jobs, or configure a remote
 supervisor. Remote job durability and checkpointing must be explicitly arranged
 for the task. No remote configuration is changed by installing this application.
 
+## Status and limitations
+
+This is a prototype. Read these before relying on it.
+
+- All tests run on one machine against a fake `codex` executable and a fake
+  SSH layer. Nothing has been exercised against a real remote host.
+- The systemd integration (`KillMode=process`, the update script) has **not**
+  been verified under real systemd.
+- It has **not** been tested end to end with a real Codex binary. In particular,
+  it is unverified whether Codex's private MCP child process exits with the
+  process group on cancellation or timeout.
+- The rsync push path with password login has **not** been verified on a real
+  host. It depends on OpenSSH 8.4 or newer (`SSH_ASKPASS_REQUIRE`).
+- Redaction is best effort, not a guarantee. An IP address placed directly
+  after words such as `driver`, `cuda` or `version` is not replaced, and some
+  file names ending in `.in` or `.app` may be treated as domain names.
+- Other processes running as the same OS user can read the mode-0600 files.
+  Development mode is not an isolation boundary.
+
 ## Local development
 
 ```bash
