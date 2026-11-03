@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "private-codex-worker"
+version = "0.1.0"
+description = "Private Codex task worker with a sanitized MCP boundary"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.20,<2", "paramiko>=3.5,<5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+codex-worker = "codex_worker.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["codex_worker*"]

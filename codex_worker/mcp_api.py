@@ -1,0 +1,300 @@
+import asyncio
+import json
+import time
+from typing import Annotated
+
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import Field
+
+from .attachments import save_artifact, stage_inputs
+from .config import JOB_ID, load_settings
+from .remote import Remote
+
+
+TERMINAL = {"completed", "failed", "blocked", "partial", "cancelled", "timed_out", "interrupted"}
+WAIT_SLICE_SECONDS = 20
+RECOVER = "Call wait_for_task with the same task_id. Do not resubmit the work."
+
+
+class PublicMCP(FastMCP):
+    async def call_tool(self, name, arguments):
+        try:
+            return await super().call_tool(name, arguments)
+        except Exception:
+            # SDK validation errors can echo entire instructions or attachments.
+            raise ToolError("invalid_tool_request") from None
+
+
+def detached(task_id, **details):
+    result = {**details, "task_cancelled": False, "next_action": RECOVER}
+    if isinstance(task_id, str) and JOB_ID.fullmatch(task_id):
+        result["job_id"] = task_id
+    return result
+
+
+def job_progress(task_id):
+    # Only worker-generated opaque IDs may enter progress messages.
+    if isinstance(task_id, str) and JOB_ID.fullmatch(task_id):
+        return f"Delegated task job_id={task_id}; execution continues independently."
+    return "Waiting for delegated task; execution continues independently."
+
+
+async def gateway_call(socket_path, method, **arguments):
+    writer = None
+    try:
+        async with asyncio.timeout(30):
+            reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=4 * 1024 * 1024 + 1)
+            writer.write(json.dumps({"method": method, "arguments": arguments}).encode() + b"\n")
+            await writer.drain()
+            raw = await reader.readline()
+            if len(raw) > 4 * 1024 * 1024:
+                return {"error_code": "response_limit"}
+            result = json.loads(raw)
+            return result if isinstance(result, dict) else {"error_code": "invalid_worker_response"}
+    except Exception:
+        return {"error_code": "worker_unavailable"}
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+async def wait_for_completion(call, task_id, context, timeout_seconds):
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 604800:
+        return {"error_code": "invalid_wait_timeout"}
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    try:
+        await context.report_progress(progress=0, message=job_progress(task_id))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return detached(task_id, wait_status="timeout")
+            async with asyncio.timeout(remaining):
+                result = await call("wait_for_task", task_id=task_id, timeout_seconds=min(WAIT_SLICE_SECONDS, remaining))
+            if not isinstance(result, dict):
+                return detached(task_id, error_code="invalid_worker_response")
+            if result.get("job_id", task_id) != task_id:
+                return detached(task_id, error_code="invalid_worker_response")
+            if result.get("status") in TERMINAL and result.get("job_id") == task_id:
+                return result
+            if "error_code" in result:
+                return detached(task_id, error_code=result["error_code"])
+            if result.get("job_id") != task_id or result.get("status") not in {"queued", "running"}:
+                return detached(task_id, error_code="invalid_worker_response")
+            await context.report_progress(progress=time.monotonic() - started,
+                                          message=job_progress(task_id))
+    except TimeoutError:
+        return detached(task_id, wait_status="timeout")
+    except Exception:
+        # Cancellation propagates; a lost listener must never cancel execution.
+        return detached(task_id, error_code="wait_failed")
+
+
+async def run_and_wait(call, target, instruction, files, context, timeout_seconds, input_id=None):
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 604800:
+        return {"error_code": "invalid_wait_timeout"}
+
+    async def submit_and_announce():
+        arguments = {"target": target, "instruction": instruction, "files": files}
+        if input_id is not None:
+            arguments["input_id"] = input_id
+        result = await call("submit_task", **arguments)
+        identifier = result.get("job_id") if isinstance(result, dict) else None
+        if isinstance(identifier, str) and JOB_ID.fullmatch(identifier):
+            try:
+                await context.report_progress(progress=0, message=job_progress(identifier))
+            except Exception:
+                pass  # The final response can still carry the acknowledged handle.
+        return result
+
+    # Finish the one submission and attempt to publish its handle even if the
+    # caller detaches during the acknowledgement. Never repeat the submission.
+    submission = asyncio.create_task(submit_and_announce())
+    try:
+        result = await asyncio.shield(submission)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.shield(submission)
+        except Exception:
+            pass
+        raise
+    except Exception:
+        result = {"error_code": "worker_unavailable"}
+    identifier = result.get("job_id") if isinstance(result, dict) else None
+    if isinstance(identifier, str) and JOB_ID.fullmatch(identifier):
+        return await wait_for_completion(call, identifier, context, timeout_seconds)
+    if isinstance(result, dict) and isinstance(result.get("error_code"), str) and result["error_code"] not in {
+        None, "worker_unavailable", "invalid_worker_response", "response_limit", "request_failed"
+    }:
+        return result
+    return {"error_code": "submission_unconfirmed", "submission_status": "unconfirmed",
+            "next_action": "Use list_tasks to recover the job_id; submission may have succeeded. Do not automatically resubmit."}
+
+
+async def file_operation(function, context, *arguments):
+    """Keep progress alive while copying bytes outside the model context."""
+    pending = asyncio.create_task(asyncio.to_thread(function, *arguments))
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=20)
+            if done:
+                return pending.result()
+            if context is not None:
+                await context.report_progress(progress=0, message="Transferring or checking task files.")
+    finally:
+        # A cancelled listener must not submit work. Its in-flight local copy
+        # may finish and leave a private, unclaimed input bundle.
+        if not pending.done():
+            pending.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+
+
+def create_public_mcp(socket_path):
+    mcp = PublicMCP("codex-worker", instructions="Delegate arbitrary execution tasks to a logical resource. Prefer run_task for new work: it submits once and waits for the filtered terminal report. For an existing job_id, call wait_for_task once with it as task_id; do not poll or resubmit. Use list_tasks to recover missing IDs; authorized clients of the same socket share tasks, without session isolation. After submit_task or continue_task, attach with wait_for_task. Call long waits from the main conversation so the host can background them when supported; this is not native MCP Tasks or unsolicited push. partial, blocked, failed, timed_out, interrupted, and cancelled are terminal outcomes, not successful completion. Never automatically retry side-effecting work or suppress intentional reruns. Do not request infrastructure identity, private worker configuration, or deployment locations. Resource environment and software capabilities may be queried. Raw logs are not exposed. Cancelling a wait only stops waiting; cancel_task stops the local agent, not necessarily remote background processes." + " This is a general-purpose Codex agent, not a catalogue of business-specific actions. Attach caller files using attachments=[{source: absolute local path, path: workspace-relative destination}]. Directories are recursive; optional list_file is a caller-local UTF-8 list of relative files to include. These bytes travel directly to the worker, outside the model context. Use existing run_task/submit_task/continue_task for any authorized coding, analysis or execution work. To retrieve an original binary or large deliverable, call get_artifact with an absolute caller-local destination; sensitive artifacts are held. Do not ask for private server addresses or attempt reverse connections to transfer files.")
+
+    async def call(method, **arguments):
+        return await gateway_call(socket_path, method, **arguments)
+
+    async def inputs(attachments, context=None):
+        if attachments is None:
+            return {}
+        return await file_operation(stage_inputs, context, socket_path, attachments)
+
+
+    @mcp.tool()
+    async def list_resources() -> dict:
+        """List logical execution resources without connection information."""
+        return await call("list_resources")
+
+    @mcp.tool()
+    async def run_task(target: str, instruction: str, ctx: Context, files: dict[str, str] | None = None,
+                       timeout_seconds: Annotated[int, Field(strict=True)] = 86400,
+                       attachments: list[dict[str, str]] | None = None) -> dict:
+        """Preferred for new free-form work: submit once, publish the opaque job_id, then wait for its filtered report. Inputs and business output remain flexible. Timeout/cancellation only detaches; recover with wait_for_task or list_tasks, never automatic resubmission. Default wait 24 hours, maximum 7 days; host call limits still apply."""
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 604800:
+            return {"error_code": "invalid_wait_timeout"}
+        staged = await inputs(attachments, ctx)
+        if "error_code" in staged:
+            return staged
+        return await run_and_wait(call, target, instruction, files, ctx, timeout_seconds, staged.get("input_id"))
+
+    @mcp.tool()
+    async def list_tasks(target: str | None = None, status: str | None = None,
+                         limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 20) -> dict:
+        """Recover recent task IDs, newest first (limit 1–100). Optional exact logical target and status filters. Only IDs, logical targets, statuses and timestamps; no instructions or logs. All authorized clients of this socket share the same task scope, without session isolation."""
+        return await call("list_tasks", target=target, status=status, limit=limit)
+
+    @mcp.tool()
+    async def submit_task(target: str, instruction: str, files: dict[str, str] | None = None,
+                          attachments: list[dict[str, str]] | None = None) -> dict:
+        """Submit arbitrary work, returning immediately. Next call wait_for_task with job_id; do not poll. Inputs are unchanged."""
+        staged = await inputs(attachments)
+        if "error_code" in staged:
+            return staged
+        arguments = {"target": target, "instruction": instruction, "files": files}
+        if "input_id" in staged:
+            arguments["input_id"] = staged["input_id"]
+        return await call("submit_task", **arguments)
+
+    @mcp.tool()
+    async def get_task(task_id: str) -> dict:
+        """Get durable task state; raw progress and logs remain private."""
+        return await call("get_task", task_id=task_id)
+
+    @mcp.tool()
+    async def get_result(task_id: str) -> dict:
+        """Get a filtered report and opaque artifact IDs. A completed agent is not proof of remote-job completion."""
+        return await call("get_result", task_id=task_id)
+
+    @mcp.tool()
+    async def wait_for_task(task_id: str, ctx: Context, timeout_seconds: int = 86400) -> dict:
+        """Attach once to a submitted task and receive its filtered terminal report (including partial/failure). Claude Code can background this main-conversation call. Sends safe heartbeats, not raw logs. Timeout/cancellation detaches only; reconnect with the same task_id, never resubmit automatically. Default wait 24 hours, maximum 7 days; client call limits still apply."""
+        return await wait_for_completion(call, task_id, ctx, timeout_seconds)
+
+    @mcp.tool()
+    async def continue_task(task_id: str, instruction: str, files: dict[str, str] | None = None,
+                            attachments: list[dict[str, str]] | None = None) -> dict:
+        """Create a follow-up with prior private report and a new workspace. Next call wait_for_task with its new job_id."""
+        staged = await inputs(attachments)
+        if "error_code" in staged:
+            return staged
+        arguments = {"task_id": task_id, "instruction": instruction, "files": files}
+        if "input_id" in staged:
+            arguments["input_id"] = staged["input_id"]
+        return await call("continue_task", **arguments)
+
+    @mcp.tool()
+    async def cancel_task(task_id: str) -> dict:
+        """Stop the local agent. Remote durable jobs require a separate explicitly delegated stop operation."""
+        return await call("cancel_task", task_id=task_id)
+
+    @mcp.tool()
+    async def get_artifact(task_id: str, artifact_id: str, destination: str | None = None,
+                           ctx: Context = None) -> dict:
+        """Preview filtered UTF-8 text, or save the original file to an absolute caller-local destination. Any file type/size is supported; sensitive files are held. Existing destinations are never overwritten. File bytes do not enter model context."""
+        if destination is not None:
+            return await file_operation(save_artifact, ctx, socket_path, task_id, artifact_id, destination)
+        return await call("get_artifact", task_id=task_id, artifact_id=artifact_id)
+
+    return mcp
+
+
+def public_mcp(socket_path):
+    create_public_mcp(socket_path).run(transport="stdio")
+
+
+def internal_mcp(private, target, job):
+    private, settings, credentials, policy = load_settings(private)
+    from .config import JOB_ID
+    if not JOB_ID.fullmatch(job):
+        raise ValueError("invalid task")
+    remote = Remote(private, settings, credentials, target, private / "jobs" / job / "work", job)
+    mcp = FastMCP("private-remote", instructions="Private worker-only tools. Use the configured logical target; do not inspect connection configuration. Original data is unchanged. Outputs are private until the public report gateway filters them.")
+
+    def audit(method, success):
+        path = private / "jobs" / job / "remote-audit.jsonl"
+        with path.open("a") as stream:
+            stream.write(json.dumps({"method": method, "success": success, "time": time.time()}) + "\n")
+
+    @mcp.tool()
+    def remote_exec(command: str, timeout_seconds: int = 120) -> dict:
+        """Execute a remote shell command. For persistent jobs use a durable remote supervisor; closing a channel does not guarantee termination."""
+        try:
+            result = remote.execute(command, timeout_seconds)
+            audit("remote_exec", result.get("exit_code") == 0)
+            return result
+        except Exception:
+            audit("remote_exec", False)
+            return {"error_code": "remote_execution_failed"}
+
+    @mcp.tool()
+    def put_file(local_path: str, remote_path: str) -> dict:
+        """Upload a workspace-relative file or directory through the existing private connection. Preserves bytes and verifies hashes; already-matching files are skipped. No reverse connection or public endpoint is needed."""
+        try:
+            result = remote.upload(local_path, remote_path)
+            audit("put_file", True)
+            return result
+        except Exception:
+            return {"error_code": "upload_failed"}
+
+    @mcp.tool()
+    def fetch_file(remote_path: str) -> dict:
+        """Store a remote file privately and return an artifact ID. Public exports are separately filtered."""
+        try:
+            result = remote.fetch(remote_path)
+            audit("fetch_file", True)
+            return result
+        except Exception:
+            return {"error_code": "download_failed"}
+
+    @mcp.tool()
+    def export_file(local_path: str) -> dict:
+        """Publish a workspace-relative deliverable of any type or size as an opaque artifact. The caller can retrieve it with get_artifact(destination=...). Sensitive original files will be held at the export boundary."""
+        try:
+            result = remote.publish(local_path)
+            audit("export_file", True)
+            return result
+        except Exception:
+            return {"error_code": "artifact_publish_failed"}
+
+    mcp.run(transport="stdio")
