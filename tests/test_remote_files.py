@@ -63,8 +63,8 @@ def remote(tmp_path, monkeypatch):
     workspace.mkdir()
     target = tmp_path / 'target'
     target.mkdir()
-    instance = Remote(tmp_path, {'resources': {'gpu-server': {'credential_ref': 'login'}}},
-                      {'login': {}}, 'gpu-server', workspace, 'job_' + 'a' * 24)
+    instance = Remote(tmp_path, {'resources': {'example-server': {'credential_ref': 'login'}}},
+                      {'login': {}}, 'example-server', workspace, 'job_' + 'a' * 24)
     (tmp_path / 'jobs' / instance.job).mkdir(parents=True)
     sftp = LocalSFTP(target)
     monkeypatch.setattr(instance, 'connect', lambda: LocalClient(sftp))

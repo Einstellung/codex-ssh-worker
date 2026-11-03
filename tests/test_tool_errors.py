@@ -27,17 +27,17 @@ def call(monkeypatch, tool, arguments):
 
 
 @pytest.mark.parametrize('tool, arguments, expected', [
-    ('submit_task', {'target': 'gpu-server', 'instruction': 'x', 'attachments': [{'source': '/' + SECRET}]},
+    ('submit_task', {'target': 'example-server', 'instruction': 'x', 'attachments': [{'source': '/' + SECRET}]},
      {'field': 'attachments', 'index': 0, 'reason': 'item_must_have_source_and_path'}),
-    ('submit_task', {'target': 'gpu-server', 'instruction': 'x', 'attachments': [{'source': '/a', 'path': 'b', SECRET: 'v'}]},
+    ('submit_task', {'target': 'example-server', 'instruction': 'x', 'attachments': [{'source': '/a', 'path': 'b', SECRET: 'v'}]},
      {'field': 'attachments', 'index': 0, 'reason': 'item_keys_must_be_source_path_list_file'}),
-    ('run_task', {'target': 'gpu-server', 'instruction': 'x', 'attachments': {'source': SECRET, 'path': 'b'}},
+    ('run_task', {'target': 'example-server', 'instruction': 'x', 'attachments': {'source': SECRET, 'path': 'b'}},
      {'field': 'attachments', 'reason': 'must_be_list'}),
-    ('run_task', {'target': 'gpu-server', 'instruction': 'x', 'attachments': [SECRET]},
+    ('run_task', {'target': 'example-server', 'instruction': 'x', 'attachments': [SECRET]},
      {'field': 'attachments', 'index': 0, 'reason': 'item_must_be_object'}),
-    ('run_task', {'target': 'gpu-server', 'files': {SECRET: SECRET}}, {'field': 'instruction', 'reason': 'required'}),
+    ('run_task', {'target': 'example-server', 'files': {SECRET: SECRET}}, {'field': 'instruction', 'reason': 'required'}),
     ('list_tasks', {'limit': SECRET}, {'field': 'limit', 'reason': 'must_be_integer'}),
-    ('submit_task', {'target': 'gpu-server', 'instruction': 'x', 'timeout_seconds': 604801},
+    ('submit_task', {'target': 'example-server', 'instruction': 'x', 'timeout_seconds': 604801},
      {'field': 'timeout_seconds', 'reason': 'above_maximum'}),
 ])
 def test_validation_errors_name_field_and_reason_without_input(monkeypatch, tool, arguments, expected):
@@ -49,7 +49,7 @@ def test_validation_errors_name_field_and_reason_without_input(monkeypatch, tool
 
 def test_run_task_accepts_attachments_with_optional_list_file_and_task_timeout(monkeypatch):
     result, calls = call(monkeypatch, 'run_task', {
-        'target': 'gpu-server', 'instruction': 'x', 'task_timeout_seconds': 120,
+        'target': 'example-server', 'instruction': 'x', 'task_timeout_seconds': 120,
         'attachments': [{'source': '/a', 'path': 'b', 'list_file': None}]})
     # Outside a real session the progress context is absent; the call still
     # validated and submitted exactly once with the forwarded values.

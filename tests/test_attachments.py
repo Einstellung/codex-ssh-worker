@@ -70,14 +70,14 @@ def test_binary_directory_and_selected_files_cross_real_service(running_service,
     listing.write_text('模型.bin\n', encoding='utf-8')
     staged = stage_inputs(address, [{'source': str(root), 'path': 'materials', 'list_file': str(listing)}])
     assert staged['file_count'] == 1 and staged['size_bytes'] == len(content)
-    submitted = rpc(address, 'submit_task', target='gpu-server', instruction='Process the supplied binary',
+    submitted = rpc(address, 'submit_task', target='example-server', instruction='Process the supplied binary',
                     input_id=staged['input_id'])
     path = worker.job(submitted['job_id'])
     assert (path / 'work/materials/模型.bin').read_bytes() == content
     assert not (path / 'work/materials/excluded.bin').exists()
     assert (path / 'work/AGENTS.md').is_file()
     assert (path / 'work/materials/模型.bin').stat().st_mode & 0o777 == 0o600
-    assert rpc(address, 'submit_task', target='gpu-server', instruction='Do not reuse',
+    assert rpc(address, 'submit_task', target='example-server', instruction='Do not reuse',
                input_id=staged['input_id']) == {'error_code': 'request_failed'}
     assert (root / '模型.bin').read_bytes() == content
 
@@ -90,7 +90,7 @@ def test_more_than_100_files_are_inputs_not_inline_text(running_service, tmp_pat
         (source / f'{index}.dat').write_bytes(bytes([index]))
     staged = stage_inputs(address, [{'source': str(source), 'path': 'data'}])
     assert staged['file_count'] == 130
-    submitted = rpc(address, 'submit_task', target='gpu-server', instruction='Analyze', input_id=staged['input_id'])
+    submitted = rpc(address, 'submit_task', target='example-server', instruction='Analyze', input_id=staged['input_id'])
     assert len(list((worker.job(submitted['job_id']) / 'work/data').iterdir())) == 130
 
 
@@ -141,8 +141,8 @@ def test_caller_symlinks_and_manifest_traversal_are_rejected(tmp_path):
 
 def test_binary_larger_than_old_limit_returns_original_and_never_overwrites(running_service, tmp_path):
     worker, address = running_service
-    task = rpc(address, 'submit_task', target='gpu-server', instruction='task')['job_id']
-    remote = Remote(worker.private, worker.settings, worker.credentials, 'gpu-server',
+    task = rpc(address, 'submit_task', target='example-server', instruction='task')['job_id']
+    remote = Remote(worker.private, worker.settings, worker.credentials, 'example-server',
                     worker.job(task) / 'work', task)
     original = b'\x00\xffbusiness payload\n' * 600000  # exceeds the old 10 MiB ceiling
     local = worker.job(task) / 'work/model.bin'
@@ -173,7 +173,7 @@ def test_binary_larger_than_old_limit_returns_original_and_never_overwrites(runn
 ])
 def test_sensitive_binary_artifact_held_before_any_content_leaves(running_service, tmp_path, content):
     worker, address = running_service
-    task = rpc(address, 'submit_task', target='gpu-server', instruction='task')['job_id']
+    task = rpc(address, 'submit_task', target='example-server', instruction='task')['job_id']
     directory = worker.job(task) / 'artifacts'
     directory.mkdir(exist_ok=True)
     identifier = 'artifact_' + 'd' * 24
@@ -230,7 +230,7 @@ def test_mcp_input_and_output_over_real_stdio(running_service, tmp_path):
             async with ClientSession(reader, writer, read_timeout_seconds=timedelta(seconds=20)) as session:
                 await session.initialize()
                 result = await session.call_tool('run_task', {
-                    'target': 'gpu-server', 'instruction': 'Process supplied file',
+                    'target': 'example-server', 'instruction': 'Process supplied file',
                     'attachments': [{'source': str(source), 'path': 'input.dat'}]})
                 assert not result.isError, result.model_dump_json()
                 body = json.loads(result.content[0].text)
@@ -238,7 +238,7 @@ def test_mcp_input_and_output_over_real_stdio(running_service, tmp_path):
                 job = worker.job(body['job_id'])
                 assert (job / 'work/input.dat').read_bytes() == source.read_bytes()
                 remote = Remote(worker.private, worker.settings, worker.credentials,
-                                'gpu-server', job / 'work', body['job_id'])
+                                'example-server', job / 'work', body['job_id'])
                 artifact = remote.publish('input.dat')
                 destination = tmp_path / 'returned.dat'
                 returned = await session.call_tool('get_artifact', {

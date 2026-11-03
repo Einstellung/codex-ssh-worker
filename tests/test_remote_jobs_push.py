@@ -30,8 +30,8 @@ def setup(tmp_path, monkeypatch):
     workspace, home = tmp_path / 'work', tmp_path / 'home'
     workspace.mkdir(); home.mkdir()
     (tmp_path / 'known_hosts').write_text('')
-    settings = {'resources': {'gpu-server': {'credential_ref': 'login', 'host': HOST, 'port': 2222, 'user': 'remote-user'}}}
-    instance = Remote(tmp_path, settings, {'login': {'password': PASSWORD}}, 'gpu-server', workspace, 'job_' + 'a' * 24)
+    settings = {'resources': {'example-server': {'credential_ref': 'login', 'host': HOST, 'port': 2222, 'user': 'remote-user'}}}
+    instance = Remote(tmp_path, settings, {'login': {'password': PASSWORD}}, 'example-server', workspace, 'job_' + 'a' * 24)
     monkeypatch.setattr(instance, 'connect', lambda: FakeClient(LocalSFTP(home)))
 
     def execute(command, timeout=120, max_bytes=262144, stdin=None):

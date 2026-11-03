@@ -65,7 +65,7 @@ def worker(tmp_path):
                     'pathlib.Path.cwd().parent.joinpath("remote-audit.jsonl").write_text(json.dumps({"success": True}) + "\\n")\n'
                     'print("PRIVATE LOG 192.0.2.1", file=sys.stderr)\n')
     fake.chmod(0o700)
-    atomic_json(tmp_path / 'resources.json', {'codex_binary': str(fake), 'max_parallel': 1, 'resources': {'gpu-server': {'host': '192.0.2.1', 'credential_ref': 'login'}}})
+    atomic_json(tmp_path / 'resources.json', {'codex_binary': str(fake), 'max_parallel': 1, 'resources': {'example-server': {'host': '192.0.2.1', 'credential_ref': 'login'}}})
     atomic_json(tmp_path / 'credentials.json', {'login': {'password': 'private-password'}})
     atomic_json(tmp_path / 'policy.json', {'sensitive_literals': ['hidden-place']})
     instance = Worker(tmp_path)
@@ -86,7 +86,7 @@ def await_terminal(worker, task):
 
 
 def test_flexible_task_lifecycle_filters_all_public_results(worker):
-    submitted = worker.public({'method': 'submit_task', 'arguments': {'target': 'gpu-server', 'instruction': 'Analyze and export data', 'files': {'data/input.txt': 'unchanged 192.0.2.1'}}})
+    submitted = worker.public({'method': 'submit_task', 'arguments': {'target': 'example-server', 'instruction': 'Analyze and export data', 'files': {'data/input.txt': 'unchanged 192.0.2.1'}}})
     identifier = submitted['job_id']
     assert await_terminal(worker, identifier)['status'] == 'completed'
     output = worker.public({'method': 'get_result', 'arguments': {'task_id': identifier}})
@@ -104,13 +104,13 @@ def test_private_methods_and_policy_override_rejected(worker):
     for method in ('read_config', 'remote_exec', 'read_logs'):
         assert worker.public({'method': method}) == {'error_code': 'unknown_method'}
     for filename in ('../secret', '/tmp/secret', 'AGENTS.md', '.codex/config.toml'):
-        output = worker.public({'method': 'submit_task', 'arguments': {'target': 'gpu-server', 'instruction': 'task', 'files': {filename: 'override'}}})
+        output = worker.public({'method': 'submit_task', 'arguments': {'target': 'example-server', 'instruction': 'task', 'files': {filename: 'override'}}})
         assert output['error_code'] == 'invalid_file_path'
     assert worker.public({'method': 'get_task', 'arguments': {'task_id': '../../credentials.json'}}) == {'error_code': 'request_failed'}
 
 
 def test_artifact_export_preserves_raw_and_holds_binary(worker):
-    task = worker.submit('gpu-server', 'task')['job_id']
+    task = worker.submit('example-server', 'task')['job_id']
     await_terminal(worker, task)
     root = worker.job(task) / 'artifacts'
     root.mkdir(mode=0o700)
@@ -136,7 +136,7 @@ def test_success_without_remote_evidence_is_blocked(worker):
     fake.write_text('#!' + sys.executable + '\nimport json, pathlib, sys\n'
                     'sys.stdin.read()\n'
                     'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text(json.dumps({"task_status": "succeeded", "report": "all done", "verification": "no actual execution"}))\n')
-    task = worker.submit('gpu-server', 'Check environment')['job_id']
+    task = worker.submit('example-server', 'Check environment')['job_id']
     assert await_terminal(worker, task)['status'] == 'blocked'
 
 
@@ -158,7 +158,7 @@ def test_remote_source_auto_resolves_current_interface(monkeypatch):
         return json.dumps([{'addr_info': [{'scope': 'global', 'local': '192.0.2.99'}]}]).encode()
     monkeypatch.setattr('codex_worker.remote.socket.socket', lambda *args: FakeSocket())
     monkeypatch.setattr('codex_worker.remote.subprocess.check_output', command)
-    remote = Remote('/tmp', {'resources': {'gpu-server': {'source_interface': 'auto', 'host': '192.0.2.1', 'port': 22, 'credential_ref': 'login'}}}, {'login': {}}, 'gpu-server')
+    remote = Remote('/tmp', {'resources': {'example-server': {'source_interface': 'auto', 'host': '192.0.2.1', 'port': 22, 'credential_ref': 'login'}}}, {'login': {}}, 'example-server')
     with pytest.raises(ConnectionRefusedError):
         remote.connect()
     assert seen == [('192.0.2.99', 0)]
@@ -170,7 +170,7 @@ def manual_task(worker, status='running'):
     identifier = 'job_' + 'c' * 24
     path = worker.jobs / identifier
     path.mkdir(mode=0o700)
-    atomic_json(path / 'state.json', {'job_id': identifier, 'target': 'gpu-server',
+    atomic_json(path / 'state.json', {'job_id': identifier, 'target': 'example-server',
                                      'status': status, 'created_at': time.time()})
     return identifier, path
 
@@ -197,7 +197,7 @@ def test_wait_does_not_occupy_execution_pool_or_respond_to_other_job(worker):
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as listeners:
         waiting = listeners.submit(worker.public, {'method': 'wait_for_task', 'arguments': {
             'task_id': identifier, 'timeout_seconds': 2}})
-        task = worker.submit('gpu-server', 'Run unrelated work')['job_id']
+        task = worker.submit('example-server', 'Run unrelated work')['job_id']
         assert await_terminal(worker, task)['status'] == 'completed'
         assert not waiting.done()
         worker.save_state(path, status='partial')
@@ -276,7 +276,7 @@ def test_public_mcp_wait_schema_and_cancellation_are_safe(monkeypatch):
             if method == 'wait_for_task':
                 entered.set()
                 await asyncio.Event().wait()
-            return {'resources': ['gpu-server']}
+            return {'resources': ['example-server']}
         class Progress:
             async def report_progress(self, **message):
                 pass
@@ -321,7 +321,7 @@ def test_completion_over_real_stdio_and_service_socket(worker, tmp_path):
             async with ClientSession(reader, writer, read_timeout_seconds=timedelta(seconds=10)) as session:
                 initialized = await session.initialize()
                 assert 'wait_for_task' in initialized.instructions
-                submitted = await session.call_tool('submit_task', {'target': 'gpu-server', 'instruction': 'Analyze data'})
+                submitted = await session.call_tool('submit_task', {'target': 'example-server', 'instruction': 'Analyze data'})
                 assert not submitted.isError, submitted.model_dump_json()
                 identifier = json.loads(submitted.content[0].text)['job_id']
                 progress_seen = asyncio.Event()
@@ -333,7 +333,7 @@ def test_completion_over_real_stdio_and_service_socket(worker, tmp_path):
                                                                  progress_callback=progress))
                 await asyncio.wait_for(progress_seen.wait(), timeout=3)
                 resources = await session.call_tool('list_resources')
-                assert json.loads(resources.content[0].text) == {'resources': ['gpu-server']}
+                assert json.loads(resources.content[0].text) == {'resources': ['example-server']}
                 result = await waiting
                 output = json.loads(result.content[0].text)
                 assert output['status'] == 'completed'
@@ -351,14 +351,14 @@ def test_completion_over_real_stdio_and_service_socket(worker, tmp_path):
                     run_messages.append(message)
                     run_progress.set()
                 running = asyncio.create_task(session.call_tool('run_task', {
-                    'target': 'gpu-server', 'instruction': 'Analyze data',
+                    'target': 'example-server', 'instruction': 'Analyze data',
                     'files': {'input.txt': 'business input'}}, progress_callback=announced))
                 await asyncio.wait_for(run_progress.wait(), timeout=3)
                 from codex_worker.config import JOB_ID
                 handle = run_messages[0].split('job_id=', 1)[1].split(';', 1)[0]
                 assert JOB_ID.fullmatch(handle)
                 assert handle != identifier
-                listing = await session.call_tool('list_tasks', {'target': 'gpu-server', 'limit': 2})
+                listing = await session.call_tool('list_tasks', {'target': 'example-server', 'limit': 2})
                 summaries = json.loads(listing.content[0].text)['tasks']
                 assert {item['job_id'] for item in summaries} == {identifier, handle}
                 assert all(set(item) <= {'job_id', 'target', 'status', 'created_at',
@@ -375,20 +375,20 @@ def test_completion_over_real_stdio_and_service_socket(worker, tmp_path):
                 assert invalid_limit_text.isError
                 assert 'private input value' not in invalid_limit_text.model_dump_json()
                 missing_instruction = await session.call_tool('run_task', {
-                    'target': 'gpu-server', 'files': {'private-filename': 'private attachment'}})
+                    'target': 'example-server', 'files': {'private-filename': 'private attachment'}})
                 assert missing_instruction.isError
                 assert 'private-filename' not in missing_instruction.model_dump_json()
                 assert 'private attachment' not in missing_instruction.model_dump_json()
                 invalid_run = await session.call_tool('run_task', {
-                    'target': 'gpu-server', 'instruction': 'Must not submit', 'timeout_seconds': 0})
+                    'target': 'example-server', 'instruction': 'Must not submit', 'timeout_seconds': 0})
                 assert json.loads(invalid_run.content[0].text) == {'error_code': 'invalid_wait_timeout'}
                 invalid_run_type = await session.call_tool('run_task', {
-                    'target': 'gpu-server', 'instruction': 'Must not submit', 'timeout_seconds': True})
+                    'target': 'example-server', 'instruction': 'Must not submit', 'timeout_seconds': True})
                 assert invalid_run_type.isError
                 assert len(list(worker.jobs.glob('job_*'))) == 2
 
                 completed = await session.call_tool('run_task', {
-                    'target': 'gpu-server', 'instruction': 'Analyze data'})
+                    'target': 'example-server', 'instruction': 'Analyze data'})
                 assert not completed.isError
                 final = json.loads(completed.content[0].text)
                 assert final['status'] == 'completed'
@@ -435,7 +435,7 @@ def test_run_cancellation_during_submission_preserves_handle_and_work(worker):
                 await acknowledge.wait()
             return result
 
-        running = asyncio.create_task(run_and_wait(call, 'gpu-server', 'Flexible task',
+        running = asyncio.create_task(run_and_wait(call, 'example-server', 'Flexible task',
             {'input.txt': 'unchanged business data'}, context, 60))
         await submitted.wait()
         running.cancel()
@@ -484,7 +484,7 @@ def test_run_post_submission_failures_always_keep_handle(failure):
             await asyncio.sleep(10)
         raise AssertionError('unexpected call')
 
-    result = asyncio.run(run_and_wait(call, 'gpu-server', 'Execute once', None, Progress(), 1))
+    result = asyncio.run(run_and_wait(call, 'example-server', 'Execute once', None, Progress(), 1))
     assert result['job_id'] == identifier
     assert result['task_cancelled'] is False
     assert 'wait_for_task' in result['next_action']
@@ -501,7 +501,7 @@ def test_run_invalid_wait_does_not_submit(timeout):
     from codex_worker.mcp_api import run_and_wait
     async def call(*args, **kwargs):
         pytest.fail('invalid timeout must not create work')
-    result = asyncio.run(run_and_wait(call, 'gpu-server', 'task', None, RecordingProgress(), timeout))
+    result = asyncio.run(run_and_wait(call, 'example-server', 'task', None, RecordingProgress(), timeout))
     assert result == {'error_code': 'invalid_wait_timeout'}
 
 
@@ -511,7 +511,7 @@ def test_run_ambiguous_acknowledgement_never_resubmits():
     async def call(method, **arguments):
         calls.append(method)
         return {'error_code': 'worker_unavailable'}
-    result = asyncio.run(run_and_wait(call, 'gpu-server', 'task', None, RecordingProgress(), 60))
+    result = asyncio.run(run_and_wait(call, 'example-server', 'task', None, RecordingProgress(), 60))
     assert calls == ['submit_task']
     assert result['error_code'] == 'submission_unconfirmed'
     assert 'list_tasks' in result['next_action']
@@ -525,10 +525,10 @@ def test_lost_submission_acknowledgement_recovers_from_listing(worker):
         calls.append(method)
         result = await asyncio.to_thread(worker.public, {'method': method, 'arguments': arguments})
         return {'error_code': 'worker_unavailable'} if method == 'submit_task' else result
-    result = asyncio.run(run_and_wait(call, 'gpu-server', 'Task with a lost acknowledgement',
+    result = asyncio.run(run_and_wait(call, 'example-server', 'Task with a lost acknowledgement',
                                       None, RecordingProgress(), 60))
     assert result['submission_status'] == 'unconfirmed'
-    listing = worker.public({'method': 'list_tasks', 'arguments': {'target': 'gpu-server'}})['tasks']
+    listing = worker.public({'method': 'list_tasks', 'arguments': {'target': 'example-server'}})['tasks']
     assert len(listing) == 1
     recovered = asyncio.run(wait_for_completion(call, listing[0]['job_id'], RecordingProgress(), 60))
     assert recovered['status'] == 'completed'
@@ -549,7 +549,7 @@ def test_run_uses_existing_filtered_terminal_report(worker, status):
             assert arguments['files'] == {'input.txt': 'original text'}
             return {'job_id': identifier, 'status': 'queued'}
         return await asyncio.to_thread(worker.public, {'method': method, 'arguments': arguments})
-    result = asyncio.run(run_and_wait(call, 'gpu-server', 'Anything the user needs',
+    result = asyncio.run(run_and_wait(call, 'example-server', 'Anything the user needs',
         {'input.txt': 'original text'}, RecordingProgress(), 60))
     assert result == worker.public({'method': 'get_result', 'arguments': {'task_id': identifier}})
     assert result['status'] == status
@@ -560,13 +560,13 @@ def test_run_uses_existing_filtered_terminal_report(worker, status):
 
 def test_list_tasks_is_bounded_filtered_and_strictly_metadata_only(worker, monkeypatch):
     from codex_worker import service
-    worker.settings['resources']['other'] = worker.settings['resources']['gpu-server']
+    worker.settings['resources']['other'] = worker.settings['resources']['example-server']
     for index in range(105):
         identifier = f'job_{index:024x}'
         path = worker.jobs / identifier
         path.mkdir(mode=0o700)
         atomic_json(path / 'state.json', {'job_id': 'untrusted identifier',
-            'target': 'other' if index % 2 else 'gpu-server',
+            'target': 'other' if index % 2 else 'example-server',
             'status': 'completed' if index % 3 else 'running', 'created_at': index,
             'updated_at': index + 1, 'finished_at': 'private timestamp', 'started_at': float('nan'),
             'instruction': 'private task text', 'report': 'private report',
@@ -583,7 +583,7 @@ def test_list_tasks_is_bounded_filtered_and_strictly_metadata_only(worker, monke
     assert [item['created_at'] for item in default] == list(range(104, 84, -1))
     assert len(worker.public({'method': 'list_tasks', 'arguments': {'limit': 100}})['tasks']) == 100
     filtered = worker.public({'method': 'list_tasks', 'arguments': {
-        'target': 'gpu-server', 'status': 'running', 'limit': 3}})['tasks']
+        'target': 'example-server', 'status': 'running', 'limit': 3}})['tasks']
     assert [item['created_at'] for item in filtered] == [102, 96, 90]
     assert all(set(item) == {'job_id', 'target', 'status', 'created_at', 'updated_at'} for item in default)
     assert default[0]['job_id'] == f'job_{104:024x}'
@@ -606,7 +606,7 @@ def test_list_tasks_rejects_unsafe_filters_and_tolerates_damaged_history(worker)
     for status in ('unknown private status', [], {}):
         assert worker.public({'method': 'list_tasks', 'arguments': {'status': status}}) == {'error_code': 'invalid_task_status'}
     result = worker.public({'method': 'list_tasks', 'arguments': {'status': 'interrupted', 'limit': 1}})
-    assert result['tasks'] == [{'job_id': identifier, 'target': 'gpu-server', 'status': 'interrupted',
+    assert result['tasks'] == [{'job_id': identifier, 'target': 'example-server', 'status': 'interrupted',
                                'created_at': json.loads((path / 'state.json').read_text())['created_at']}]
 
 
@@ -617,14 +617,14 @@ def test_created_handle_survives_scheduling_and_public_filter_errors(worker, mon
     with monkeypatch.context() as patch:
         patch.setattr(worker.pool, 'submit', broken)
         scheduled = worker.public({'method': 'submit_task', 'arguments': {
-            'target': 'gpu-server', 'instruction': 'task'}})
+            'target': 'example-server', 'instruction': 'task'}})
     assert scheduled['status'] == 'failed'
     assert scheduled['error_code'] == 'execution_failed'
     assert worker.job(scheduled['job_id']).exists()
     with monkeypatch.context() as patch:
         patch.setattr(service, 'make_redactor', broken)
         filtered = worker.public({'method': 'submit_task', 'arguments': {
-            'target': 'gpu-server', 'instruction': 'another task'}})
+            'target': 'example-server', 'instruction': 'another task'}})
     assert set(filtered) == {'job_id', 'error_code'}
     assert filtered['error_code'] == 'request_failed'
     assert await_terminal(worker, filtered['job_id'])['status'] == 'completed'
@@ -640,7 +640,7 @@ def test_run_attaches_after_acknowledged_submission_error():
         if method == 'submit_task':
             return {'job_id': identifier, 'error_code': 'request_failed'}
         return final
-    assert asyncio.run(run_and_wait(call, 'gpu-server', 'task', None, RecordingProgress(), 60)) == final
+    assert asyncio.run(run_and_wait(call, 'example-server', 'task', None, RecordingProgress(), 60)) == final
     assert calls == ['submit_task', 'wait_for_task']
 
 

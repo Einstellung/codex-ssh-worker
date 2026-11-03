@@ -38,7 +38,7 @@ def make_private(root):
     fake.chmod(0o700)
     atomic_json(root / 'resources.json', {'codex_binary': str(fake), 'max_parallel': 2,
                                           'monitor_interval_seconds': 0.05,
-                                          'resources': {'gpu-server': {'host': '192.0.2.1'}}})
+                                          'resources': {'example-server': {'host': '192.0.2.1'}}})
     atomic_json(root / 'credentials.json', {})
     atomic_json(root / 'policy.json', {'sensitive_literals': ['hidden-place']})
     return root
@@ -90,7 +90,7 @@ def alive(pid):
 
 
 def running_job(worker, instruction):
-    identifier = worker.submit('gpu-server', instruction)['job_id']
+    identifier = worker.submit('example-server', instruction)['job_id']
     path = worker.jobs / identifier
     until(lambda: (path / 'process.json').exists() and (path / 'agent.pid').exists())
     return identifier, path, read_private(path / 'process.json')
@@ -100,7 +100,7 @@ def manual_job(root, record=None, exit_code=None, report=True):
     identifier = 'job_' + os.urandom(12).hex()
     path = root / 'jobs' / identifier
     (path / 'work').mkdir(parents=True, mode=0o700)
-    atomic_json(path / 'state.json', {'job_id': identifier, 'target': 'gpu-server',
+    atomic_json(path / 'state.json', {'job_id': identifier, 'target': 'example-server',
                                      'status': 'running', 'created_at': time.time()})
     if record is not None:
         atomic_json(path / 'process.json', record)
@@ -199,11 +199,11 @@ def test_cancel_escalates_to_sigkill_after_grace(private):
 def test_task_timeout_parameter_stops_task(private):
     root, workers, _ = private
     worker = start(root, workers)
-    assert worker.submit('gpu-server', 'x', timeout_seconds=0)['error_code'] == 'invalid_task_timeout'
-    assert worker.submit('gpu-server', 'x', timeout_seconds=604801)['error_code'] == 'invalid_task_timeout'
-    assert worker.submit('gpu-server', 'x', timeout_seconds=True)['error_code'] == 'invalid_task_timeout'
+    assert worker.submit('example-server', 'x', timeout_seconds=0)['error_code'] == 'invalid_task_timeout'
+    assert worker.submit('example-server', 'x', timeout_seconds=604801)['error_code'] == 'invalid_task_timeout'
+    assert worker.submit('example-server', 'x', timeout_seconds=True)['error_code'] == 'invalid_task_timeout'
     submitted = worker.public({'method': 'submit_task', 'arguments': {
-        'target': 'gpu-server', 'instruction': 'sleep:30', 'timeout_seconds': 1}})
+        'target': 'example-server', 'instruction': 'sleep:30', 'timeout_seconds': 1}})
     identifier = submitted['job_id']
     path = worker.jobs / identifier
     until(lambda: (path / 'agent.pid').exists())
@@ -248,7 +248,7 @@ def test_queued_jobs_are_started_by_next_instance(private):
     identifier = manual_job(root, report=False)
     path = root / 'jobs' / identifier
     atomic_json(path / 'state.json', {**state(root, identifier), 'status': 'queued'})
-    atomic_json(path / 'request.json', {'target': 'gpu-server', 'instruction': 'quick', 'parent': None})
+    atomic_json(path / 'request.json', {'target': 'example-server', 'instruction': 'quick', 'parent': None})
     start(root, workers)
     until(lambda: state(root, identifier)['status'] == 'completed')
 
@@ -276,7 +276,7 @@ def test_sigterm_to_real_service_leaves_task_running(private):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.connect(str(socket_path))
         connection.sendall(json.dumps({'method': 'submit_task', 'arguments': {
-            'target': 'gpu-server', 'instruction': 'sleep:2'}}).encode() + b'\n')
+            'target': 'example-server', 'instruction': 'sleep:2'}}).encode() + b'\n')
         identifier = json.loads(connection.makefile().readline())['job_id']
     path = root / 'jobs' / identifier
     until(lambda: (path / 'agent.pid').exists())

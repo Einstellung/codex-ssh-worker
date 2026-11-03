@@ -1,9 +1,10 @@
 # Private Codex Worker
 
-Claude delegates unrestricted natural-language tasks to `gpu-server`; a private
-Codex worker resolves the resource and uses SSH without putting connection
-credentials in the task prompt. Public reports are sanitized independently of
-the model. Software versions and hardware capabilities are permitted.
+Claude delegates unrestricted natural-language tasks to a configured logical
+resource. A private Codex worker resolves that resource and uses SSH without
+putting connection credentials in the task prompt. Public reports are sanitized
+independently of the model. Software versions and hardware capabilities are
+permitted.
 
 ## Important deployment status
 
@@ -44,13 +45,13 @@ Example `resources.json` (placeholders only):
   "task_timeout_seconds": 3600,
   "client_uid": 1000,
   "resources": {
-    "gpu-server": {
+    "example-server": {
       "connector": "ssh",
       "host": "<private endpoint>",
       "port": 22,
       "user": "<private account>",
       "source_interface": "<optional local physical interface>",
-      "credential_ref": "gpu-server-login",
+      "credential_ref": "example-server-login",
       "private_hostname": "<private hostname>",
       "private_home": "<private home>"
     }
@@ -169,7 +170,7 @@ keeping connection identity private.
 
 ```json
 {
-  "target": "gpu-server",
+  "target": "example-server",
   "instruction": "Process the attached materials and return the deliverables.",
   "attachments": [
     {"source": "/caller/materials", "path": "materials"},
@@ -406,7 +407,7 @@ would require those extra controls and artifact approval.
 
 ```bash
 .venv/bin/python -m pytest -q
-.venv/bin/python -m codex_worker.cli check
+.venv/bin/python -m codex_worker.cli check --target example-server
 ```
 
 The `check` command executes only `python3 --version` remotely, verifies the

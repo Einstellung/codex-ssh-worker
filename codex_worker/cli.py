@@ -16,9 +16,11 @@ def main():
     parser.add_argument("mode", choices=("serve", "mcp", "internal", "filter", "check"))
     parser.add_argument("--private-dir", type=Path, default=DEFAULT_PRIVATE)
     parser.add_argument("--socket", type=Path)
-    parser.add_argument("--target", default="gpu-server")
+    parser.add_argument("--target")
     parser.add_argument("--job")
     args = parser.parse_args()
+    if args.mode in ("internal", "check") and not args.target:
+        parser.error(f"--target is required for {args.mode} mode")
     socket_path = args.socket or args.private_dir / "worker.sock"
     try:
         if args.mode == "mcp":
