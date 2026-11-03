@@ -17,3 +17,6 @@ codex-worker = "codex_worker.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["codex_worker*"]
+
+[tool.setuptools.package-data]
+codex_worker = ["remote_job.sh"]
