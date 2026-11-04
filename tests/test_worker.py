@@ -93,6 +93,9 @@ def test_flexible_task_lifecycle_filters_all_public_results(worker):
     assert '192.0.2.1' not in json.dumps(output)
     assert json.loads(output['report']['report'])['metrics']['rows'] == 9
     path = worker.job(identifier)
+    launch = json.loads((path / 'launch.json').read_text())['arguments']
+    assert launch[launch.index('--model') + 1] == 'gpt-6.1-terra'
+    assert 'model_reasoning_effort="high"' in launch
     assert (path / 'work/data/input.txt').read_text() == 'unchanged 192.0.2.1'
     assert '192.0.2.1' in (path / 'stderr.log').read_text()
     continued = worker.public({'method': 'continue_task', 'arguments': {'task_id': identifier, 'instruction': 'Now validate the export'}})

@@ -6,6 +6,9 @@ putting connection credentials in the task prompt. Public reports are sanitized
 independently of the model. Software versions and hardware capabilities are
 permitted.
 
+Worker tasks explicitly select `gpt-6.1-terra` with `model_reasoning_effort` set
+to `high`. The service account must have access to the requested model.
+
 ## Important deployment status
 
 The local development mode uses mode-0700 directories and mode-0600 files.

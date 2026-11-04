@@ -228,6 +228,7 @@ class Worker:
                 atomic_json(path / "report-schema.json", REPORT_SCHEMA)
                 python = sys.executable
                 arguments = [self.settings["codex_binary"], "exec", "--ignore-user-config", "--skip-git-repo-check",
+                             "--model", "gpt-6.1-terra", "-c", 'model_reasoning_effort="high"',
                              "--sandbox", "workspace-write", "--cd", str(path / "work"), "--color", "never",
                              "-o", str(path / "final.txt"),
                              "--output-schema", str(path / "report-schema.json"),
