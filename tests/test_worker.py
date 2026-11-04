@@ -681,7 +681,10 @@ def test_scripts_keep_tasks_alive_across_restarts():
     assert 'KillMode=process' in install and 'KillMode=control-group\n' not in install
     assert '/etc/systemd/system/codex-worker.service.d/killmode.conf' in update
     assert update.index('ensure_killmode\n') < update.index('systemctl stop codex-worker.service')
-    assert 'processes.py' in update.split('modules=(', 1)[1].split(')', 1)[0]
+    listed = update.split('modules=(', 1)[1].split(')', 1)[0].split()
+    shipped = sorted(p.name for p in Path('codex_worker').iterdir() if p.suffix in ('.py', '.sh'))
+    # An update that forgets a new module leaves an installed worker that fails on import.
+    assert sorted(listed) == shipped
     for script in ('install-isolated.sh', 'update-isolated.sh', 'repair-isolated.sh'):
         subprocess.run(['bash', '-n', 'scripts/' + script], check=True)
 
