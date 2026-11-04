@@ -17,7 +17,10 @@ install_root=/opt/codex-worker
 test -d "$install_root/codex_worker"
 test -f /etc/systemd/system/codex-worker.service
 test -x "$install_root/venv/bin/python"
-systemctl is-active --quiet codex-worker.service
+# A service that is crash-looping or stopped is exactly the one that needs this
+# update, so being active is not required. Remember whether it was running: only
+# a running service has task processes that an old-code restart could kill.
+if systemctl is-active --quiet codex-worker.service; then was_active=1; else was_active=0; fi
 
 # Running tasks no longer block an update: the service no longer kills them on
 # exit and the restarted service adopts them. This only counts them so the
@@ -66,7 +69,7 @@ ensure_killmode
 # The service being stopped is the *installed* code. Versions before task
 # adoption kill their own children on exit and leave no process record, so
 # for that one transition running tasks would still die: keep refusing then.
-if ! grep -q 'def adopt' "$install_root/codex_worker/service.py"; then
+if [[ $was_active == 1 ]] && ! grep -q 'def adopt' "$install_root/codex_worker/service.py"; then
   if [[ -n $(count_active) ]]; then
     echo 'The installed worker predates task adoption and would kill running tasks on restart; finish them first.' >&2
     exit 1
@@ -133,7 +136,29 @@ for destination in "$install_root/codex_worker" "$package_dir"; do
 done
 install -o root -g root -m 644 "$staging/new/README.md" "$install_root/README.md"
 systemctl start codex-worker.service
-systemctl is-active --quiet codex-worker.service
+
+# A Type=simple unit reports active the moment it is forked, even if Python dies
+# a second later. Ready means the socket exists and the unit stayed active for
+# several consecutive seconds. On failure show why before the rollback runs.
+wait_ready() {
+  local streak=0 i
+  for i in $(seq 1 30); do
+    if systemctl is-active --quiet codex-worker.service && [[ -S /run/codex-worker/worker.sock ]]; then
+      streak=$((streak + 1))
+      [[ $streak -ge 4 ]] && return 0
+    else
+      streak=0
+    fi
+    sleep 1
+  done
+  return 1
+}
+if ! wait_ready; then
+  echo 'The updated service did not stay up. Last log lines (stderr from the failed start):' >&2
+  journalctl -u codex-worker.service -n 30 --no-pager -o cat >&2 || true
+  echo 'Rolling back to the previous code.' >&2
+  exit 1
+fi
 update_finished=1
 echo 'Updated local worker code. Private config, authentication, jobs, and remote state were not migrated or replaced.'
 echo 'Reconnect the MCP client. Existing task tools now accept binary attachments; get_artifact can save original files to a caller-local destination.'

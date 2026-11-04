@@ -685,6 +685,9 @@ def test_scripts_keep_tasks_alive_across_restarts():
     shipped = sorted(p.name for p in Path('codex_worker').iterdir() if p.suffix in ('.py', '.sh'))
     # An update that forgets a new module leaves an installed worker that fails on import.
     assert sorted(listed) == shipped
+    # A crash-looping service must still be updatable, and success must mean it stayed up.
+    assert 'systemctl is-active --quiet codex-worker.service\n' not in update.split('ensure_killmode()', 1)[0]
+    assert 'wait_ready' in update.split('systemctl start codex-worker.service\n', 1)[1].split('update_finished=1', 1)[0]
     for script in ('install-isolated.sh', 'update-isolated.sh', 'repair-isolated.sh'):
         subprocess.run(['bash', '-n', 'scripts/' + script], check=True)
 
