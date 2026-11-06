@@ -9,6 +9,9 @@ permitted.
 Worker tasks explicitly select `gpt-6.1-terra` with `model_reasoning_effort` set
 to `high`. The service account must have access to the requested model.
 
+Worker tasks explicitly select `gpt-6.1-terra` with `model_reasoning_effort` set
+to `high`. The service account must have access to the requested model.
+
 ## Important deployment status
 
 The local development mode uses mode-0700 directories and mode-0600 files.
@@ -112,7 +115,7 @@ over-redacted. There is no promise that all location inference is prevented.
 - `list_tasks(target?, status?, limit=20)`: recover recent task IDs, newest
   `created_at` first (ties by ID). Limit must be an integer from 1 to 100;
   booleans are rejected. Filters match an exact configured logical target and
-  one of `queued`, `running`, `completed`, `partial`, `blocked`, `failed`,
+  one of `queued`, `running`, `waiting_for_input`, `completed`, `partial`, `blocked`, `failed`,
   `timed_out`, `interrupted`, or `cancelled`. Each summary contains only opaque
   `job_id`, logical `target`, `status`, and available numeric timestamps
   (`created_at`, `updated_at`, `started_at`, `finished_at`). Older history may
@@ -128,6 +131,17 @@ over-redacted. There is no promise that all location inference is prevented.
 - `wait_for_task(task_id, timeout_seconds=86400)`: attach once and receive the
   same filtered terminal report as `get_result`, without repeated model tool
   calls. Maximum wait is seven days. Safe progress heartbeats contain no logs.
+- A running agent can call its private `ask_caller` tool when it needs a
+  decision or missing information. `run_task` and `wait_for_task` then return
+  `status: waiting_for_input` with the filtered `question`, `question_id`, and
+  original `job_id`. Ask the user when appropriate, call
+  `answer_question(task_id, question_id, answer)`, then call `wait_for_task`
+  again on the same job. The running session and workspace are preserved and
+  no new job is submitted. Questions pass through the same redactor as reports.
+  A question defaults to a 15-minute wait (maximum one hour); the task's
+  execution timeout still applies. Timeout or cancellation is not approval;
+  late and duplicate answers are rejected. This supports agent-initiated
+  questions, not arbitrary mid-task steering.
 - `continue_task(task_id, instruction, files?)`: new task with prior private
   report as context. New workspace; pass needed inputs again. Existing remote
   files remain available according to the task's permissions.
@@ -322,7 +336,7 @@ filters to recover the ID and inspect candidates with `wait_for_task`. Listings
 intentionally omit instruction text, so concurrent similar tasks may require
 operator reconciliation. Never automatically submit again to recover feedback.
 
-After `submit_task` or `continue_task`, call `wait_for_task` once using the
+After `submit_task` or `continue_task`, call `wait_for_task` using the
 returned `job_id` as `task_id`. It also attaches to jobs submitted before this
 feature was installed. It returns on every terminal outcome: `completed` means
 the agent reported success with execution evidence; `partial` means only part

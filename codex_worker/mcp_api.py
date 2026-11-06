@@ -13,6 +13,7 @@ from typing_extensions import NotRequired, TypedDict
 from .attachments import save_artifact, stage_inputs
 from .config import JOB_ID, load_settings
 from .remote import BinaryFileError, Remote
+from .questions import ask
 
 
 TERMINAL = {"completed", "failed", "blocked", "partial", "cancelled", "timed_out", "interrupted"}
@@ -137,6 +138,8 @@ async def wait_for_completion(call, task_id, context, timeout_seconds):
                 return detached(task_id, error_code="invalid_worker_response")
             if result.get("status") in TERMINAL and result.get("job_id") == task_id:
                 return result
+            if result.get("status") == "waiting_for_input" and result.get("job_id") == task_id:
+                return result
             if "error_code" in result:
                 return detached(task_id, error_code=result["error_code"])
             if result.get("job_id") != task_id or result.get("status") not in {"queued", "running"}:
@@ -212,7 +215,7 @@ async def file_operation(function, context, *arguments):
 
 
 def create_public_mcp(socket_path):
-    mcp = PublicMCP("codex-worker", instructions="Delegate arbitrary execution tasks to a logical resource. Prefer run_task for new work: it submits once and waits for the filtered terminal report. For an existing job_id, call wait_for_task once with it as task_id; do not poll or resubmit. Use list_tasks to recover missing IDs; authorized clients of the same socket share tasks, without session isolation. After submit_task or continue_task, attach with wait_for_task. Call long waits from the main conversation so the host can background them when supported; this is not native MCP Tasks or unsolicited push. partial, blocked, failed, timed_out, interrupted, and cancelled are terminal outcomes, not successful completion. Never automatically retry side-effecting work or suppress intentional reruns. Do not request infrastructure identity, private worker configuration, or deployment locations. Resource environment and software capabilities may be queried. Raw logs are not exposed. Cancelling a wait only stops waiting; cancel_task stops the local agent, not necessarily remote background processes." + " This is a general-purpose Codex agent, not a catalogue of business-specific actions. Attach caller files using attachments=[{source: absolute local path, path: workspace-relative destination, list_file?: absolute local list file}] on run_task, submit_task or continue_task. Directories are recursive; optional list_file is a caller-local UTF-8 list of relative files to include. These bytes travel directly to the worker, outside the model context. Use existing run_task/submit_task/continue_task for any authorized coding, analysis or execution work. To retrieve an original binary or large deliverable, call get_artifact with an absolute caller-local destination; sensitive artifacts are held. Do not ask for private server addresses or attempt reverse connections to transfer files.")
+    mcp = PublicMCP("codex-worker", instructions="Delegate arbitrary execution tasks to a logical resource. Prefer run_task for new work: it submits once and waits for the filtered terminal report. For an existing job_id, call wait_for_task once with it as task_id; do not poll or resubmit. Use list_tasks to recover missing IDs; authorized clients of the same socket share tasks, without session isolation. After submit_task or continue_task, attach with wait_for_task. Call long waits from the main conversation so the host can background them when supported; this is not native MCP Tasks or unsolicited push. partial, blocked, failed, timed_out, interrupted, and cancelled are terminal outcomes, not successful completion. When run_task or wait_for_task returns waiting_for_input, present the filtered question to the user if their decision is needed, call answer_question with its job_id and question_id, then call wait_for_task on the same job. Do not invent approval. Never automatically retry side-effecting work or suppress intentional reruns. Do not request infrastructure identity, private worker configuration, or deployment locations. Resource environment and software capabilities may be queried. Raw logs are not exposed. Cancelling a wait only stops waiting; cancel_task stops the local agent, not necessarily remote background processes." + " This is a general-purpose Codex agent, not a catalogue of business-specific actions. Attach caller files using attachments=[{source: absolute local path, path: workspace-relative destination, list_file?: absolute local list file}] on run_task, submit_task or continue_task. Directories are recursive; optional list_file is a caller-local UTF-8 list of relative files to include. These bytes travel directly to the worker, outside the model context. Use existing run_task/submit_task/continue_task for any authorized coding, analysis or execution work. To retrieve an original binary or large deliverable, call get_artifact with an absolute caller-local destination; sensitive artifacts are held. Do not ask for private server addresses or attempt reverse connections to transfer files.")
 
     async def call(method, **arguments):
         return await gateway_call(socket_path, method, **arguments)
@@ -233,7 +236,7 @@ def create_public_mcp(socket_path):
                        timeout_seconds: Annotated[int, Field(strict=True)] = 86400,
                        attachments: list[Attachment] | None = None,
                        task_timeout_seconds: TaskTimeout = None) -> dict:
-        """Preferred for new free-form work: submit once, publish the opaque job_id, then wait for its filtered report. Parameters: target is a logical resource name from list_resources; instruction is free text; files is an optional object of workspace-relative path -> UTF-8 text; attachments is an optional list [{source: absolute caller-local path, path: workspace-relative destination, list_file?: absolute caller-local UTF-8 list of relative members (directory sources only)}], copied as real bytes outside the model context. timeout_seconds bounds only this wait (integer seconds, default 24 hours, maximum 7 days); task_timeout_seconds is the optional execution limit after which the task is stopped (integer 1-604800, default from worker settings). Timeout/cancellation of the wait only detaches; recover with wait_for_task or list_tasks, never automatic resubmission. Host call limits still apply. Validation errors return a fixed error_code, field and reason, never your input."""
+        """Preferred for new free-form work: submit once, publish the opaque job_id, then wait for its filtered report or waiting_for_input question. Parameters: target is a logical resource name from list_resources; instruction is free text; files is an optional object of workspace-relative path -> UTF-8 text; attachments is an optional list [{source: absolute caller-local path, path: workspace-relative destination, list_file?: absolute caller-local UTF-8 list of relative members (directory sources only)}], copied as real bytes outside the model context. timeout_seconds bounds only this wait (integer seconds, default 24 hours, maximum 7 days); task_timeout_seconds is the optional execution limit after which the task is stopped (integer 1-604800, default from worker settings). Timeout/cancellation of the wait only detaches; recover with wait_for_task or list_tasks, never automatic resubmission. Host call limits still apply. Validation errors return a fixed error_code, field and reason, never your input."""
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 604800:
             return {"error_code": "invalid_wait_timeout"}
         staged = await inputs(attachments, ctx)
@@ -275,8 +278,13 @@ def create_public_mcp(socket_path):
 
     @mcp.tool()
     async def wait_for_task(task_id: str, ctx: Context, timeout_seconds: int = 86400) -> dict:
-        """Attach once to a submitted task and receive its filtered terminal report (including partial/failure). Claude Code can background this main-conversation call. Sends safe heartbeats, not raw logs. Timeout/cancellation detaches only; reconnect with the same task_id, never resubmit automatically. Default wait 24 hours, maximum 7 days; client call limits still apply."""
+        """Attach to a submitted task until a filtered terminal report or waiting_for_input question. For a question call answer_question, then wait again on this task. Claude Code can background this main-conversation call. Sends safe heartbeats, not raw logs. Timeout/cancellation detaches only; reconnect with the same task_id, never resubmit automatically. Default wait 24 hours, maximum 7 days; client call limits still apply."""
         return await wait_for_completion(call, task_id, ctx, timeout_seconds)
+
+    @mcp.tool()
+    async def answer_question(task_id: str, question_id: str, answer: str) -> dict:
+        """Answer the pending question in the same task, then call wait_for_task again. Do not assume user approval."""
+        return await call("answer_question", task_id=task_id, question_id=question_id, answer=answer)
 
     @mcp.tool()
     async def continue_task(task_id: str, instruction: str, files: dict[str, str] | None = None,
@@ -453,6 +461,14 @@ def internal_mcp(private, target, job):
             stream.write(json.dumps({"method": method, "success": success, "time": time.time()}) + "\n")
 
     register_remote_tools(mcp, remote, private / "jobs" / job / "pushes", audit)
+
+    @mcp.tool()
+    def ask_caller(question: str, timeout_seconds: int = 900) -> dict:
+        """Ask the caller a necessary question and wait in this task. On timeout report blocked or partial; do not assume approval."""
+        try:
+            return ask(private / "jobs" / job, question, timeout_seconds)
+        except Exception:
+            return {"error_code": "question_failed"}
 
     @mcp.tool()
     def remote_exec(command: str, timeout_seconds: int = 120) -> dict:

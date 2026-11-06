@@ -178,6 +178,136 @@ def manual_task(worker, status='running'):
     return identifier, path
 
 
+def test_question_pauses_same_job_filters_and_resumes(worker):
+    from codex_worker.questions import ask
+    identifier, path = manual_task(worker)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        reply = pool.submit(ask, path, 'Can I process 192.0.2.1 hidden-place private-password?', 5)
+        question = worker.public({'method': 'wait_for_task', 'arguments': {
+            'task_id': identifier, 'timeout_seconds': 3}})
+        assert question['status'] == 'waiting_for_input'
+        assert question['job_id'] == identifier
+        assert all(secret not in json.dumps(question) for secret in
+                   ('192.0.2.1', 'hidden-place', 'private-password'))
+        assert worker.public({'method': 'get_task', 'arguments': {'task_id': identifier}})['status'] == 'waiting_for_input'
+        waiting = worker.public({'method': 'list_tasks', 'arguments': {'status': 'waiting_for_input'}})['tasks']
+        assert [item['job_id'] for item in waiting] == [identifier]
+        args = {'task_id': identifier, 'question_id': question['question_id'], 'answer': 'Yes, continue'}
+        assert worker.public({'method': 'answer_question', 'arguments': args})['status'] == 'answered'
+        assert worker.public({'method': 'answer_question', 'arguments': args})['error_code'] == 'question_not_pending'
+        assert reply.result(timeout=2)['answer'] == 'Yes, continue'
+        assert worker.public({'method': 'get_result', 'arguments': {'task_id': identifier}})['status'] == 'running'
+
+
+def test_question_timeout_rejects_late_answers(worker):
+    from codex_worker.questions import ask, pending_question
+    identifier, path = manual_task(worker)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        reply = pool.submit(ask, path, 'Need a decision', 1)
+        question = worker.public({'method': 'wait_for_task', 'arguments': {'task_id': identifier, 'timeout_seconds': 2}})
+        assert question['status'] == 'waiting_for_input'
+        assert reply.result(timeout=3)['error_code'] == 'question_timed_out'
+    assert pending_question(path) is None
+    result = worker.public({'method': 'answer_question', 'arguments': {
+        'task_id': identifier, 'question_id': question['question_id'], 'answer': 'too late'}})
+    assert result['error_code'] == 'question_not_pending'
+
+
+def test_question_rejected_after_cancel(worker):
+    from codex_worker.questions import ask
+    identifier, path = manual_task(worker)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        reply = pool.submit(ask, path, 'Need a decision', 5)
+        question = worker.public({'method': 'wait_for_task', 'arguments': {'task_id': identifier, 'timeout_seconds': 2}})
+        worker.public({'method': 'cancel_task', 'arguments': {'task_id': identifier}})
+        assert reply.result(timeout=2)['error_code'] == 'task_not_running'
+        result = worker.public({'method': 'answer_question', 'arguments': {
+            'task_id': identifier, 'question_id': question['question_id'], 'answer': 'yes'}})
+        assert result['error_code'] == 'task_not_running'
+
+
+def test_client_delivers_question_without_calling_it_completion():
+    from codex_worker.mcp_api import wait_for_completion
+    identifier = 'job_' + 'a' * 24
+    question = {'job_id': identifier, 'status': 'waiting_for_input',
+                'question_id': 'question_' + 'b' * 24, 'question': 'Choose?'}
+    class Context:
+        async def report_progress(self, **kwargs):
+            pass
+    async def call(method, **kwargs):
+        return question
+    assert asyncio.run(wait_for_completion(call, identifier, Context(), 10)) == question
+
+
+def test_real_worker_subprocess_asks_and_continues_same_job(worker):
+    fake = Path(worker.settings['codex_binary'])
+    fake.write_text('#!' + sys.executable + '\n'
+                    'import json,pathlib,sys\n'
+                    'from codex_worker.questions import ask\n'
+                    'sys.stdin.read()\n'
+                    'job = pathlib.Path.cwd().parent\n'
+                    'reply = ask(job, "Which option?", 5)\n'
+                    'job.joinpath("remote-audit.jsonl").write_text(json.dumps({"success": True}) + "\\n")\n'
+                    'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text(json.dumps({"task_status": "succeeded", "report": reply["answer"], "verification": "same execution"}))\n')
+    task = worker.public({'method': 'submit_task', 'arguments': {'target': 'example-server', 'instruction': 'ask once'}})['job_id']
+    question = worker.public({'method': 'wait_for_task', 'arguments': {'task_id': task, 'timeout_seconds': 5}})
+    assert question['status'] == 'waiting_for_input'
+    assert worker.public({'method': 'answer_question', 'arguments': {
+        'task_id': task, 'question_id': question['question_id'], 'answer': 'option A'}})['status'] == 'answered'
+    result = worker.public({'method': 'wait_for_task', 'arguments': {'task_id': task, 'timeout_seconds': 5}})
+    assert result['job_id'] == task and result['status'] == 'completed'
+    assert result['report']['report'] == 'option A'
+
+
+def test_internal_mcp_asks_and_receives_answer(worker):
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    identifier, path = manual_task(worker)
+    async def scenario():
+        params = StdioServerParameters(command=sys.executable, args=[
+            '-m', 'codex_worker.cli', 'internal', '--private-dir', str(worker.private),
+            '--target', 'example-server', '--job', identifier])
+        async with stdio_client(params) as (reader, writer):
+            async with ClientSession(reader, writer) as session:
+                await session.initialize()
+                pending = asyncio.create_task(session.call_tool('ask_caller', {'question': 'Which option?', 'timeout_seconds': 5}))
+                question = await asyncio.to_thread(worker.public, {'method': 'wait_for_task', 'arguments': {
+                    'task_id': identifier, 'timeout_seconds': 3}})
+                assert question['status'] == 'waiting_for_input'
+                assert worker.public({'method': 'answer_question', 'arguments': {
+                    'task_id': identifier, 'question_id': question['question_id'], 'answer': 'option B'}})['status'] == 'answered'
+                response = await asyncio.wait_for(pending, 3)
+                assert 'option B' in response.model_dump_json()
+    asyncio.run(scenario())
+
+
+def test_question_survives_worker_restart(worker):
+    fake = Path(worker.settings['codex_binary'])
+    fake.write_text('#!' + sys.executable + '\n'
+                    'import json,pathlib,sys\n'
+                    'from codex_worker.questions import ask\n'
+                    'sys.stdin.read()\n'
+                    'job = pathlib.Path.cwd().parent\n'
+                    'reply = ask(job, "Continue?", 10)\n'
+                    'job.joinpath("remote-audit.jsonl").write_text(json.dumps({"success": True}) + "\\n")\n'
+                    'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text(json.dumps({"task_status":"succeeded", "report":reply["answer"], "verification":"adopted"}))\n')
+    task = worker.public({'method': 'submit_task', 'arguments': {'target': 'example-server', 'instruction': 'ask'}})['job_id']
+    question = worker.public({'method': 'wait_for_task', 'arguments': {'task_id': task, 'timeout_seconds': 5}})
+    assert question['status'] == 'waiting_for_input'
+    worker.close()
+    replacement = Worker(worker.private)
+    try:
+        recovered = replacement.public({'method': 'get_result', 'arguments': {'task_id': task}})
+        assert recovered['question_id'] == question['question_id']
+        answer = replacement.public({'method': 'answer_question', 'arguments': {
+            'task_id': task, 'question_id': question['question_id'], 'answer': 'yes'}})
+        assert answer['status'] == 'answered'
+        result = replacement.public({'method': 'wait_for_task', 'arguments': {'task_id': task, 'timeout_seconds': 5}})
+        assert result['status'] == 'completed' and result['report']['report'] == 'yes'
+    finally:
+        replacement.close()
+
+
 @pytest.mark.parametrize('status', ['completed', 'partial', 'failed', 'blocked', 'cancelled', 'timed_out', 'interrupted'])
 def test_wait_delivers_each_terminal_outcome_and_filtered_report(worker, status):
     identifier, path = manual_task(worker)
@@ -702,7 +832,7 @@ def test_new_public_schemas_preserve_compatible_tools_and_hide_context():
         tools = {tool.name: tool for tool in await server.list_tools()}
         assert set(tools) == {'run_task', 'list_tasks', 'list_resources', 'submit_task',
                              'get_task', 'get_result', 'wait_for_task', 'continue_task',
-                             'cancel_task', 'get_artifact'}
+                             'cancel_task', 'get_artifact', 'answer_question'}
         assert 'ctx' not in tools['run_task'].inputSchema['properties']
         assert tools['run_task'].inputSchema['required'] == ['target', 'instruction']
         assert tools['run_task'].inputSchema['properties']['timeout_seconds']['default'] == 86400
