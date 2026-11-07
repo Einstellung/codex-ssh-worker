@@ -92,7 +92,7 @@ service_stopped=0
 update_finished=0
 cleanup() {
   if [[ $service_stopped == 1 && $update_finished == 0 ]]; then
-    for module in attachments.py exports.py processes.py push.py remote_job.sh questions.py; do
+    for module in attachments.py exports.py processes.py push.py remote_job.sh questions.py sanitize.py; do
       if [[ ! -f $staging/source-backup/$module ]]; then rm -f -- "$install_root/codex_worker/$module"; fi
       if [[ ! -f $staging/package-backup/$module ]]; then rm -f -- "$package_dir/$module"; fi
     done
@@ -108,7 +108,7 @@ cp -a -- "$install_root/codex_worker" "$staging/source-backup"
 cp -a -- "$package_dir" "$staging/package-backup"
 cp -a -- "$install_root/README.md" "$staging/README-backup.md"
 mkdir "$staging/new"
-modules=(__init__.py cli.py config.py mcp_api.py privacy.py remote.py service.py attachments.py exports.py processes.py push.py remote_job.sh questions.py)
+modules=(__init__.py cli.py config.py mcp_api.py privacy.py remote.py service.py attachments.py exports.py processes.py push.py remote_job.sh questions.py sanitize.py)
 for module in "${modules[@]}"; do
   install -o root -g root -m 644 "$source_root/codex_worker/$module" "$staging/new/$module"
 done

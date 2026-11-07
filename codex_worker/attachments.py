@@ -258,8 +258,12 @@ def save_artifact(socket_path, task_id, artifact_id, destination):
                     raise ValueError("artifact digest mismatch")
                 # Hard-link publication is atomic and refuses to overwrite.
                 os.link(temporary, destination)
-                return {"artifact_id": artifact_id, "saved": True,
-                        "size_bytes": response["size_bytes"], "sha256": response["sha256"]}
+                result = {"artifact_id": artifact_id, "saved": True,
+                          "size_bytes": response["size_bytes"], "sha256": response["sha256"]}
+                for key in ("sanitized", "source_sha256", "redacted_files", "redacted_fields"):
+                    if key in response:
+                        result[key] = response[key]
+                return result
     except Exception:
         return {"error_code": "artifact_transfer_failed"}
     finally:

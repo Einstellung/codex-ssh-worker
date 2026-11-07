@@ -146,7 +146,7 @@ over-redacted. There is no promise that all location inference is prevented.
   report as context. New workspace; pass needed inputs again. Existing remote
   files remain available according to the task's permissions.
 - `get_artifact(task_id, artifact_id)`: filtered UTF-8 preview up to 1 MiB;
-  larger/binary previews remain private; provide a caller-local `destination` to save an inspected original file.
+  larger/binary previews remain private; provide a caller-local `destination` to save an inspected file or sanitized copy.
 - `cancel_task(task_id)`: terminates the local Codex process group only, including
   tasks adopted after a service restart (SIGTERM, then SIGKILL after 5 seconds). It does
   **not** guarantee remote processes stopped; delegate a remote stop separately.
@@ -297,7 +297,7 @@ use the existing public tool:
 }
 ```
 
-The caller saves the approved original bytes with mode 0600, verifies SHA256,
+The caller saves the inspected bytes with mode 0600, verifies SHA256,
 and atomically refuses to overwrite an existing destination. No file content,
 private source path or exception is returned in the tool response. Without
 `destination`, `get_artifact` retains its compatible filtered text preview.
@@ -305,9 +305,17 @@ private source path or exception is returned in the tool response. Without
 Before bytes leave the service, an immutable private snapshot is inspected for
 known private literals, IP addresses, geographic terms/coordinates, credential
 assignments, private keys and common GPS metadata. ZIP, tar, gzip, bzip2 and xz
-members are inspected recursively. Sensitive, encrypted/unsupported archive,
-malformed or uninspectable artifacts are held; original files are never silently
-redacted or rewritten. Progress messages contain no filenames or logs.
+members are inspected recursively. When an original fails inspection, the
+worker attempts to build a separate sanitized copy: it redacts private text and
+fields, removes archive metadata, recursively rebuilds supported containers,
+and then runs the inspection again. The source is never modified. A sanitized
+export explicitly returns `sanitized: true`, both `source_sha256` and `sha256`,
+and aggregate `redacted_files` and `redacted_fields` counts; consumers must
+not treat this copy as byte-identical to the source. JSON numbers are parsed as
+decimal values to preserve scientific numeric precision. Sensitive binary data
+that cannot be safely rewritten, encrypted/unsupported archives, links,
+malformed data, over 128 MiB of decompressed input, and files that still fail
+inspection remain held. Progress messages contain no filenames or logs.
 This is defense against accidental disclosure, not a complete content-security
 system: arbitrary encodings, undocumented metadata formats, semantic location
 hints and covert channels cannot be reliably detected. The agent must keep

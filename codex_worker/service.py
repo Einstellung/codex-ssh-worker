@@ -18,6 +18,7 @@ from .attachments import CHUNK, input_workspace, open_regular, receive_inputs
 from .config import ARTIFACT_ID, JOB_ID, atomic_json, load_settings, read_private, scoped_path
 from .exports import ExportBlocked, export_snapshot
 from .privacy import make_redactor
+from .sanitize import sanitized_snapshot
 from .processes import WRAPPER, proc_stat, read_exit_code, read_progress, same_process, terminate_group
 from .questions import QUESTION_ID, pending_question, question_lock
 
@@ -509,8 +510,11 @@ def serve(private, socket_path):
                         redactor = make_redactor(worker.settings, worker.credentials, worker.policy, worker.private)
                         try:
                             with open_regular(path) as source:
-                                snapshot, result = export_snapshot(source, worker.private, redactor,
-                                    worker.settings.get("export_inspection_seconds", 300))
+                                timeout = worker.settings.get("export_inspection_seconds", 300)
+                                try:
+                                    snapshot, result = export_snapshot(source, worker.private, redactor, timeout)
+                                except ExportBlocked:
+                                    snapshot, result = sanitized_snapshot(source, worker.private, redactor, timeout)
                         except ExportBlocked:
                             result = {"artifact_id": identifier, "status": "review_required",
                                       "error_code": "artifact_export_blocked"}

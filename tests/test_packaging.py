@@ -49,3 +49,4 @@ def test_built_wheel_contains_remote_job_script(tmp_path):
     with zipfile.ZipFile(wheels[0]) as archive:
         assert 'codex_worker/remote_job.sh' in archive.namelist()
         assert 'codex_worker/questions.py' in archive.namelist()
+        assert 'codex_worker/sanitize.py' in archive.namelist()

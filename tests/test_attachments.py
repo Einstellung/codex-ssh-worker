@@ -203,6 +203,114 @@ def test_archive_member_contents_and_names_are_inspected(tmp_path):
         ExportGuard(Redactor(['hidden-place'])).scan(data)
 
 
+def test_sensitive_archive_is_exported_as_separate_sanitized_copy(running_service, tmp_path):
+    worker, address = running_service
+    task = rpc(address, 'submit_task', target='example-server', instruction='task')['job_id']
+    directory = worker.job(task) / 'artifacts'
+    directory.mkdir(exist_ok=True)
+    identifier = 'artifact_' + 'e' * 24
+    archive_path = directory / identifier
+    score = '0.123456789012345678901234567890'
+    with tarfile.open(archive_path, 'w:gz') as archive:
+        contents = {
+            'result.json': ('{"host":"hidden-place","server_ip":"192.0.2.10",'
+                            '"score":' + score + ',"rows":530}').encode(),
+            'logs/hidden-place.txt': b'connected to 192.0.2.10\npassword=private-password\n',
+            'clean.bin': b'\x00\xffsafe binary payload',
+        }
+        for name, content in contents.items():
+            item = tarfile.TarInfo(name)
+            item.size = len(content)
+            archive.addfile(item, io.BytesIO(content))
+    original = archive_path.read_bytes()
+    destination = tmp_path / 'sanitized.tar.gz'
+    result = save_artifact(address, task, identifier, str(destination))
+    assert result.get('saved') and result['sanitized'] is True, result
+    assert result['source_sha256'] == hashlib.sha256(original).hexdigest()
+    assert result['sha256'] == hashlib.sha256(destination.read_bytes()).hexdigest()
+    assert result['redacted_files'] >= 2 and result['redacted_fields'] >= 3
+    assert archive_path.read_bytes() == original
+    from decimal import Decimal
+    with tarfile.open(destination, 'r:gz') as archive:
+        names = archive.getnames()
+        assert len(names) == 3 and all('hidden-place' not in name for name in names)
+        content = archive.extractfile('result.json').read()
+        data = json.loads(content, parse_float=Decimal)
+        assert data['score'] == Decimal(score) and data['rows'] == 530
+        assert data['host'] == '[redacted-field]' and data['server_ip'] == '[redacted-field]'
+        assert archive.extractfile('clean.bin').read() == contents['clean.bin']
+        for member in archive:
+            raw = archive.extractfile(member).read()
+            assert all(secret not in raw for secret in (b'hidden-place', b'192.0.2.10', b'private-password'))
+
+
+def test_sanitizer_rejects_links_and_duplicate_json_keys(tmp_path):
+    from codex_worker.sanitize import sanitized_snapshot
+    with pytest.raises(ExportBlocked):
+        sanitized_snapshot(io.BytesIO(b'{"host":"hidden-place","host":"other"}'), tmp_path, Redactor(['hidden-place']))
+    data = io.BytesIO()
+    with tarfile.open(fileobj=data, mode='w:gz') as archive:
+        item = tarfile.TarInfo('link')
+        item.type = tarfile.SYMTYPE
+        item.linkname = '/private'
+        archive.addfile(item)
+    with pytest.raises(ExportBlocked):
+        sanitized_snapshot(io.BytesIO(data.getvalue()), tmp_path, Redactor())
+
+
+def test_nested_archive_and_jsonl_are_sanitized_with_exact_numbers(tmp_path):
+    from codex_worker.sanitize import sanitized_snapshot
+    from decimal import Decimal
+    payload = (b'{"md5":"a123","score":0.1234567890123456789,"host":"hidden-place"}\n'
+               b'{"md5":"b456","score":-2.00100000000000000001,"ip":"192.0.2.10"}\n')
+    nested = io.BytesIO()
+    with zipfile.ZipFile(nested, 'w') as archive:
+        archive.writestr('data/hidden-place.jsonl', payload)
+    original = gzip.compress(nested.getvalue())
+    with sanitized_snapshot(io.BytesIO(original), tmp_path, Redactor(['hidden-place']))[0] as output:
+        with gzip.GzipFile(fileobj=output) as zipped:
+            with zipfile.ZipFile(io.BytesIO(zipped.read())) as archive:
+                assert len(archive.namelist()) == 1
+                assert 'hidden-place' not in archive.namelist()[0]
+                data = archive.read(archive.namelist()[0])
+    assert b'192.0.2.10' not in data and b'hidden-place' not in data
+    rows = [json.loads(line, parse_float=Decimal) for line in data.splitlines()]
+    assert [x['score'] for x in rows] == [Decimal('0.1234567890123456789'), Decimal('-2.00100000000000000001')]
+    assert [x['md5'] for x in rows] == ['a123', 'b456']
+
+
+def test_sanitized_gzip_is_verified_after_decompression(monkeypatch, tmp_path):
+    from codex_worker.sanitize import sanitized_snapshot
+    original_scan = ExportGuard.scan
+    def reject_compressed_noise(self, stream, depth=0):
+        stream.seek(0)
+        beginning = stream.read(2)
+        stream.seek(0)
+        if beginning == b'\x1f\x8b':
+            raise ExportBlocked()  # Simulate an IP-shaped compressed byte sequence.
+        return original_scan(self, stream, depth)
+    monkeypatch.setattr(ExportGuard, 'scan', reject_compressed_noise)
+    original = gzip.compress(b'{"host":"hidden-place","score":0.1234567890123456789}')
+    snapshot, result = sanitized_snapshot(io.BytesIO(original), tmp_path, Redactor(['hidden-place']))
+    with snapshot:
+        output = gzip.decompress(snapshot.read())
+    assert result['sanitized'] is True
+    assert b'hidden-place' not in output and b'0.1234567890123456789' in output
+
+
+def test_sanitizer_preserves_safe_punctuation_and_filenames_inside_commands(tmp_path):
+    from codex_worker.sanitize import sanitized_snapshot
+    original = json.dumps({'cmd': 'python /home/private/run.py --input result.json --peer 192.0.2.10',
+                           'reason': '测试（通过），保留原标点', 'score': 0.25}, ensure_ascii=False).encode()
+    snapshot, metadata = sanitized_snapshot(io.BytesIO(original), tmp_path, Redactor(['/home/private']))
+    with snapshot:
+        value = json.loads(snapshot.read())
+    assert value['reason'] == '测试（通过），保留原标点'
+    assert 'run.py' in value['cmd'] and 'result.json' in value['cmd']
+    assert '/home/private' not in value['cmd'] and '192.0.2.10' not in value['cmd']
+    assert value['score'] == 0.25 and metadata['sanitized'] is True
+
+
 def test_export_snapshot_is_immutable_and_scans_across_chunk_boundaries(tmp_path):
     original = io.BytesIO(b'x' * (CHUNK - 5) + b' 192.0.2.20')
     with pytest.raises(ExportBlocked):
